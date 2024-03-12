@@ -37,11 +37,70 @@
 #include "os/os_specific.h"
 #include "strings/string_utils.h"
 
+#include <vector>
+#include "minhook/include/MinHook.h"
+
 #define VERBOSE_DEBUG_HOOK OPTION_OFF
+
+#define INLINE_HOOK OPTION_ON
+
+#if ENABLED(INLINE_HOOK)
+typedef HMODULE(WINAPI *FunTypeLoadLibraryA)(LPCSTR lpLibFileName);
+typedef HMODULE(WINAPI *FunTypeLoadLibraryW)(LPCWSTR lpLibFileName);
+typedef HMODULE(WINAPI *FunTypeLoadLibraryExA)(LPCSTR lpLibFileName, HANDLE fileHandle, DWORD flags);
+typedef HMODULE(WINAPI *FunTypeLoadLibraryExW)(LPCWSTR lpLibFileName, HANDLE fileHandle, DWORD flags);
+
+// typedef FARPROC(WINAPI *FunTypeGetProcAddress)(HMODULE mod, LPCSTR func);
+
+FunTypeLoadLibraryA fLoadLibraryA;
+FunTypeLoadLibraryW fLoadLibraryW;
+FunTypeLoadLibraryExA fLoadLibraryExA;
+FunTypeLoadLibraryExW fLoadLibraryExW;
+// FunTypeGetProcAddress fGetProcAddress;
+#endif
 
 // map from address of IAT entry, to original contents
 std::map<void **, void *> s_InstalledHooks;
 Threading::CriticalSection installedLock;
+
+std::map<void **, bool> s_InlineInstalledHooks;
+Threading::CriticalSection inlineInstalledLock;
+
+#if ENABLED(INLINE_HOOK)
+bool ApplyHookInline(FunctionHook &hook, void **IATentry, bool &already)
+{
+  MH_STATUS status = MH_Initialize();
+  if(status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED)
+  {
+    return false;
+  }
+  if(MH_CreateHook(hook.orig, hook.hook, hook.orig) != MH_OK)
+  {
+    return false;
+  }
+  if(MH_EnableHook(hook.orig) != MH_OK)
+  {
+    return false;
+  }
+  SCOPED_LOCK(inlineInstalledLock);
+  if(s_InlineInstalledHooks.find(hook.orig) == s_InlineInstalledHooks.end())
+    s_InlineInstalledHooks[hook.orig] = true;
+
+#if ENABLED(VERBOSE_DEBUG_HOOK)
+  if(hook.orig)
+  {
+    RDCDEBUG("Patching Inline Hook for %s: %p to %p", hook.function.c_str(), hook.orig,
+             *hook.orig);
+  }
+  else
+  {
+    RDCDEBUG("Patching Inline Hook for %s: %p", hook.function.c_str(), hook.orig);
+  }
+
+#endif
+  return true;
+}
+#endif
 
 bool ApplyHook(FunctionHook &hook, void **IATentry, bool &already)
 {
@@ -204,12 +263,19 @@ struct CachedHookData
           // fetch all function hooks here, since we want to fill out the original function pointer
           // even in case nothing imports from that function (which means it would not get filled
           // out through FunctionHook::ApplyHook)
+#if ENABLED(INLINE_HOOK)
+          for(FunctionHook &hook : it->second.FunctionHooks)
+          {
+            if(hook.orig == NULL)
+              *hook.orig = GetProcAddress(module, hook.function.c_str());
+          }
+#else
           for(FunctionHook &hook : it->second.FunctionHooks)
           {
             if(hook.orig && *hook.orig == NULL)
               *hook.orig = GetProcAddress(module, hook.function.c_str());
           }
-
+#endif
           it->second.FetchOrdinalNames();
         }
         else if(it->second.module != module)
@@ -249,20 +315,25 @@ struct CachedHookData
             // new location
             RDCWARN("%s moved from %p to %p, re-initialising orig pointers", it->first.c_str(),
                     it->second.module, module);
-
+#if ENABLED(INLINE_HOOK)
+            for(FunctionHook &hook : it->second.FunctionHooks)
+            {
+              *hook.orig = GetProcAddress(module, hook.function.c_str());
+            }
+#else
             // we also need to re-initialise the hooks as the orig pointers are now stale
             for(FunctionHook &hook : it->second.FunctionHooks)
             {
               if(hook.orig)
                 *hook.orig = GetProcAddress(module, hook.function.c_str());
             }
-
+#endif
             it->second.module = module;
           }
         }
       }
     }
-
+#if DISABLED(INLINE_HOOK)
     // for safety (and because we don't need to), ignore these modules
     if(!_stricmp(modName, "kernel32.dll") || !_stricmp(modName, "powrprof.dll") ||
        !_stricmp(modName, "CoreMessaging.dll") || !_stricmp(modName, "opengl32.dll") ||
@@ -276,7 +347,18 @@ struct CachedHookData
        strstr(lowername, "igvk") == lowername || strstr(lowername, "nvopencl") == lowername ||
        strstr(lowername, "nvapi") == lowername)
       return;
-
+#endif
+	// we need inline hook kernel32's LoadLibrary function.
+    if(/*!_stricmp(modName, "kernel32.dll") ||*/ !_stricmp(modName, "powrprof.dll") ||
+       !_stricmp(modName, "CoreMessaging.dll") || !_stricmp(modName, "opengl32.dll") ||
+       !_stricmp(modName, "gdi32.dll") || !_stricmp(modName, "gdi32full.dll") ||
+       !_stricmp(modName, "nvoglv32.dll") || !_stricmp(modName, "nvoglv64.dll") ||
+       !_stricmp(modName, "vulkan-1.dll") || !_stricmp(modName, "nvcuda.dll") ||
+       strstr(lowername, "cudart") == lowername || strstr(lowername, "msvcr") == lowername ||
+       strstr(lowername, "msvcp") == lowername || strstr(lowername, "nv-vk") == lowername ||
+       strstr(lowername, "amdvlk") == lowername || strstr(lowername, "igvk") == lowername ||
+       strstr(lowername, "nvopencl") == lowername || strstr(lowername, "nvapi") == lowername)
+      return;
     if(ignores.find(lowername) != ignores.end())
       return;
 
@@ -306,7 +388,38 @@ struct CachedHookData
       FreeLibrary(refcountModHandle);
       return;
     }
+#if ENABLED(VERBOSE_DEBUG_HOOK)
+    // RDCDEBUG("=== import descriptors:");
+#endif
 
+#if ENABLED(INLINE_HOOK)
+    DllHookset *hookset = NULL;
+
+    for(auto it = DllHooks.begin(); it != DllHooks.end(); ++it)
+      if(!_stricmp(it->first.c_str(), modName))
+        hookset = &it->second;
+    if(hookset)
+    {
+      for(auto it = hookset->FunctionHooks.begin(); it != hookset->FunctionHooks.end(); ++it)
+      {
+        bool already = false;
+        bool applied;
+        {
+          SCOPED_LOCK(lock);
+          applied = ApplyHookInline(*it, NULL, already);
+          if(!applied || (already))
+          {
+#if ENABLED(VERBOSE_DEBUG_HOOK)
+            RDCDEBUG("Stopping hooking module, %d %d", (int)applied, (int)already);
+#endif
+            FreeLibrary(refcountModHandle);
+            return;
+          }
+        }
+      }
+    }
+
+#else
     char *PE00 = (char *)(baseAddress + dosheader->e_lfanew);
     PIMAGE_FILE_HEADER fileHeader = (PIMAGE_FILE_HEADER)(PE00 + 4);
     PIMAGE_OPTIONAL_HEADER optHeader =
@@ -494,7 +607,7 @@ struct CachedHookData
 
       importDesc++;
     }
-
+#endif
     FreeLibrary(refcountModHandle);
   }
 };
@@ -583,7 +696,15 @@ static void HookAllModules()
     if(!it->second.hooksfetched)
     {
       it->second.hooksfetched = true;
-
+#if ENABLED(INLINE_HOOK)
+      // fetch all function hooks here, if we didn't above (perhaps because this library was
+      // late-loaded)
+      for(FunctionHook &hook : it->second.FunctionHooks)
+      {
+        if(hook.orig == NULL)
+          *hook.orig = GetProcAddress(it->second.module, hook.function.c_str());
+      }
+#else
       // fetch all function hooks here, if we didn't above (perhaps because this library was
       // late-loaded)
       for(FunctionHook &hook : it->second.FunctionHooks)
@@ -591,6 +712,7 @@ static void HookAllModules()
         if(hook.orig && *hook.orig == NULL)
           *hook.orig = GetProcAddress(it->second.module, hook.function.c_str());
       }
+#endif
     }
 
     rdcarray<FunctionLoadCallback> callbacks;
@@ -653,7 +775,11 @@ HMODULE WINAPI Hooked_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE fileHandle, DW
 
   // we can use the function naked, as when setting up the hook for LoadLibraryExA, our own module
   // was excluded from IAT patching
+#if ENABLED(INLINE_HOOK)
+  HMODULE mod = fLoadLibraryExA(lpLibFileName, fileHandle, flags);
+#else
   HMODULE mod = LoadLibraryExA(lpLibFileName, fileHandle, flags);
+#endif
 
 #if ENABLED(VERBOSE_DEBUG_HOOK)
   RDCDEBUG("LoadLibraryA(%s)", lpLibFileName);
@@ -696,8 +822,11 @@ HMODULE WINAPI Hooked_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE fileHandle, D
 
   // we can use the function naked, as when setting up the hook for LoadLibraryExA, our own module
   // was excluded from IAT patching
+#if ENABLED(INLINE_HOOK)
+  HMODULE mod = fLoadLibraryExW(lpLibFileName, fileHandle, flags);
+#else
   HMODULE mod = LoadLibraryExW(lpLibFileName, fileHandle, flags);
-
+#endif
   DWORD err = GetLastError();
 
   if(dohook && mod && !IsAPISet(lpLibFileName))
@@ -742,6 +871,13 @@ FARPROC WINAPI Hooked_GetProcAddress(HMODULE mod, LPCSTR func)
       it->second.module = GetModuleHandleA(it->first.c_str());
       if(it->second.module)
       {
+#if ENABLED(INLINE_HOOK)
+        for(FunctionHook &hook : it->second.FunctionHooks)
+        {
+          if(hook.orig == NULL)
+            *hook.orig = GetProcAddress(it->second.module, hook.function.c_str());
+        }
+#else
         // fetch all function hooks here, since we want to fill out the original function pointer
         // even in case nothing imports from that function (which means it would not get filled
         // out through FunctionHook::ApplyHook)
@@ -750,7 +886,7 @@ FARPROC WINAPI Hooked_GetProcAddress(HMODULE mod, LPCSTR func)
           if(hook.orig && *hook.orig == NULL)
             *hook.orig = GetProcAddress(it->second.module, hook.function.c_str());
         }
-
+#endif
         it->second.FetchOrdinalNames();
       }
     }
@@ -836,43 +972,71 @@ FARPROC WINAPI Hooked_GetProcAddress(HMODULE mod, LPCSTR func)
 }
 static void InitHookData()
 {
-  if(!s_HookData)
+#if ENABLED(INLINE_HOOK)
+  s_HookData = new CachedHookData;
+  RDCASSERT(s_HookData->DllHooks.empty());
+  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(FunctionHook(
+      "LoadLibraryA", reinterpret_cast<void **>(&fLoadLibraryA), &Hooked_LoadLibraryA));
+  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(FunctionHook(
+      "LoadLibraryW", reinterpret_cast<void **>(&fLoadLibraryW), &Hooked_LoadLibraryW));
+  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(FunctionHook(
+      "LoadLibraryExA", reinterpret_cast<void **>(&fLoadLibraryExA), &Hooked_LoadLibraryExA));
+  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(FunctionHook(
+      "LoadLibraryExW", reinterpret_cast<void **>(&fLoadLibraryExW), &Hooked_LoadLibraryExW));
+  /*s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
+      FunctionHook("GetProcAddress", NULL, &Hooked_GetProcAddress));*/
+
+  for(const char *apiset :
+      {"api-ms-win-core-libraryloader-l1-1-0.dll", "api-ms-win-core-libraryloader-l1-1-1.dll",
+       "api-ms-win-core-libraryloader-l1-1-2.dll", "api-ms-win-core-libraryloader-l1-2-0.dll",
+       "api-ms-win-core-libraryloader-l1-2-1.dll"})
   {
-    s_HookData = new CachedHookData;
-
-    RDCASSERT(s_HookData->DllHooks.empty());
-    s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
-        FunctionHook("LoadLibraryA", NULL, &Hooked_LoadLibraryA));
-    s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
-        FunctionHook("LoadLibraryW", NULL, &Hooked_LoadLibraryW));
-    s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
-        FunctionHook("LoadLibraryExA", NULL, &Hooked_LoadLibraryExA));
-    s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
-        FunctionHook("LoadLibraryExW", NULL, &Hooked_LoadLibraryExW));
-    s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
-        FunctionHook("GetProcAddress", NULL, &Hooked_GetProcAddress));
-
-    for(const char *apiset :
-        {"api-ms-win-core-libraryloader-l1-1-0.dll", "api-ms-win-core-libraryloader-l1-1-1.dll",
-         "api-ms-win-core-libraryloader-l1-1-2.dll", "api-ms-win-core-libraryloader-l1-2-0.dll",
-         "api-ms-win-core-libraryloader-l1-2-1.dll"})
-    {
-      s_HookData->DllHooks[apiset].FunctionHooks.push_back(
-          FunctionHook("LoadLibraryA", NULL, &Hooked_LoadLibraryA));
-      s_HookData->DllHooks[apiset].FunctionHooks.push_back(
-          FunctionHook("LoadLibraryW", NULL, &Hooked_LoadLibraryW));
-      s_HookData->DllHooks[apiset].FunctionHooks.push_back(
-          FunctionHook("LoadLibraryExA", NULL, &Hooked_LoadLibraryExA));
-      s_HookData->DllHooks[apiset].FunctionHooks.push_back(
-          FunctionHook("LoadLibraryExW", NULL, &Hooked_LoadLibraryExW));
-      s_HookData->DllHooks[apiset].FunctionHooks.push_back(
-          FunctionHook("GetProcAddress", NULL, &Hooked_GetProcAddress));
-    }
-
-    GetModuleHandleEx(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        (LPCTSTR)&s_HookData, &s_HookData->ownmodule);
+    s_HookData->DllHooks[apiset].FunctionHooks.push_back(FunctionHook(
+        "LoadLibraryA", reinterpret_cast<void **>(&fLoadLibraryA), &Hooked_LoadLibraryA));
+    s_HookData->DllHooks[apiset].FunctionHooks.push_back(FunctionHook(
+        "LoadLibraryW", reinterpret_cast<void **>(&fLoadLibraryW), &Hooked_LoadLibraryW));
+    s_HookData->DllHooks[apiset].FunctionHooks.push_back(FunctionHook(
+        "LoadLibraryExA", reinterpret_cast<void **>(&fLoadLibraryExA), &Hooked_LoadLibraryExA));
+    s_HookData->DllHooks[apiset].FunctionHooks.push_back(FunctionHook(
+        "LoadLibraryExW", reinterpret_cast<void **>(&fLoadLibraryExW), &Hooked_LoadLibraryExW));
+    /*s_HookData->DllHooks[apiset].FunctionHooks.push_back(
+        FunctionHook("GetProcAddress", NULL, &Hooked_GetProcAddress));*/
   }
+#else
+  s_HookData = new CachedHookData;
+  RDCASSERT(s_HookData->DllHooks.empty());
+  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
+      FunctionHook("LoadLibraryA", NULL, &Hooked_LoadLibraryA));
+  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
+      FunctionHook("LoadLibraryW", NULL, &Hooked_LoadLibraryW));
+  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
+      FunctionHook("LoadLibraryExA", NULL, &Hooked_LoadLibraryExA));
+  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
+      FunctionHook("LoadLibraryExW", NULL, &Hooked_LoadLibraryExW));
+  s_HookData->DllHooks["kernel32.dll"].FunctionHooks.push_back(
+      FunctionHook("GetProcAddress", NULL, &Hooked_GetProcAddress));
+
+  for(const char *apiset :
+      {"api-ms-win-core-libraryloader-l1-1-0.dll", "api-ms-win-core-libraryloader-l1-1-1.dll",
+       "api-ms-win-core-libraryloader-l1-1-2.dll", "api-ms-win-core-libraryloader-l1-2-0.dll",
+       "api-ms-win-core-libraryloader-l1-2-1.dll"})
+  {
+    s_HookData->DllHooks[apiset].FunctionHooks.push_back(
+        FunctionHook("LoadLibraryA", NULL, &Hooked_LoadLibraryA));
+    s_HookData->DllHooks[apiset].FunctionHooks.push_back(
+        FunctionHook("LoadLibraryW", NULL, &Hooked_LoadLibraryW));
+    s_HookData->DllHooks[apiset].FunctionHooks.push_back(
+        FunctionHook("LoadLibraryExA", NULL, &Hooked_LoadLibraryExA));
+    s_HookData->DllHooks[apiset].FunctionHooks.push_back(
+        FunctionHook("LoadLibraryExW", NULL, &Hooked_LoadLibraryExW));
+    s_HookData->DllHooks[apiset].FunctionHooks.push_back(
+        FunctionHook("GetProcAddress", NULL, &Hooked_GetProcAddress));
+  }
+#endif
+
+  GetModuleHandleEx(
+      GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+      (LPCTSTR)&s_HookData, &s_HookData->ownmodule);
 }
 
 void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionHook &hook)
@@ -972,6 +1136,16 @@ void LibraryHooks::RemoveHooks()
       continue;
     }
   }
+#if ENABLED(INLINE_HOOK)
+  for(auto it = s_InlineInstalledHooks.begin(); it != s_InlineInstalledHooks.end(); ++it)
+  {
+    if(MH_DisableHook(it->first) != MH_OK)
+    {
+      RDCERR("Failed to restore inline hook 0x%p", it->first);
+      continue;
+    }
+  }
+#endif
 }
 
 bool LibraryHooks::Detect(const char *identifier)
