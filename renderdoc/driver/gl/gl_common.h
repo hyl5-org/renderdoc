@@ -618,13 +618,13 @@ GLint GetNumVertexBuffers();
 struct ShaderReflection;
 struct ShaderBindpointMapping;
 
-void EvaluateSPIRVBindpointMapping(GLuint curProg, int shadIdx, const ShaderReflection *refl,
-                                   ShaderBindpointMapping &mapping);
+void EvaluateVertexAttributeBinds(GLuint curProg, const ShaderReflection *refl, bool spirv,
+                                  rdcarray<int32_t> &vertexAttrBindings);
 
-void GetBindpointMapping(GLuint curProg, int shadIdx, const ShaderReflection *refl,
-                         ShaderBindpointMapping &mapping);
-
-void ResortBindings(ShaderReflection *refl, ShaderBindpointMapping *mapping);
+void GetCurrentBinding(GLuint curProg, ShaderReflection *refl, const ShaderResource &resource,
+                       uint32_t &slot, bool &used);
+void GetCurrentBinding(GLuint curProg, ShaderReflection *refl, const ConstantBlock &cblock,
+                       uint32_t &slot, bool &used);
 
 // calls glBlitFramebuffer but ensures no state can interfere like scissor or color mask
 // pops state for only a single drawbuffer!
@@ -844,6 +844,7 @@ extern bool IsGLES;
   EXT_COMP_CHECK(ARB_texture_buffer_object, OES_texture_buffer)                             \
   EXT_COMP_CHECK(ARB_texture_buffer_range, EXT_texture_buffer)                              \
   EXT_COMP_CHECK(ARB_texture_buffer_range, OES_texture_buffer)                              \
+  EXT_COMP_CHECK(ARB_clip_control, EXT_clip_control)                                        \
   EXT_COMP_CHECK(EXT_framebuffer_sRGB, EXT_sRGB_write_control)
 
 // extensions we know we want to check for are precached, indexd by this enum
@@ -2238,6 +2239,7 @@ enum class GLChunk : uint32_t
 
   glMapBufferRangeEXT,
   glFlushMappedBufferRangeEXT,
+  glClipControlEXT,
 
   Max,
 };

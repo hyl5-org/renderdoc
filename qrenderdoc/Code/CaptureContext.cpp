@@ -42,6 +42,7 @@
 #include "Windows/BufferViewer.h"
 #include "Windows/CommentView.h"
 #include "Windows/DebugMessageView.h"
+#include "Windows/DescriptorViewer.h"
 #include "Windows/Dialogs/CaptureDialog.h"
 #include "Windows/Dialogs/CrashDialog.h"
 #include "Windows/Dialogs/LiveCapture.h"
@@ -1065,6 +1066,10 @@ void CaptureContext::LoadCaptureThreaded(const QString &captureFile, const Repla
     m_BufferList = r->GetBuffers();
     for(BufferDescription &b : m_BufferList)
       m_Buffers[b.resourceId] = &b;
+
+    m_DescriptorStoreList = r->GetDescriptorStores();
+    for(DescriptorStoreDescription &d : m_DescriptorStoreList)
+      m_DescriptorStores[d.resourceId] = &d;
 
     m_PostloadProgress = 0.8f;
 
@@ -2568,11 +2573,10 @@ void CaptureContext::RevertShaderEdit(IShaderViewer *viewer, ResourceId id)
   });
 }
 
-IShaderViewer *CaptureContext::DebugShader(const ShaderBindpointMapping *bind,
-                                           const ShaderReflection *shader, ResourceId pipeline,
+IShaderViewer *CaptureContext::DebugShader(const ShaderReflection *shader, ResourceId pipeline,
                                            ShaderDebugTrace *trace, const rdcstr &debugContext)
 {
-  return ShaderViewer::DebugShader(*this, bind, shader, pipeline, trace, debugContext,
+  return ShaderViewer::DebugShader(*this, shader, pipeline, trace, debugContext,
                                    m_MainWindow->Widget());
 }
 
@@ -2584,6 +2588,25 @@ IShaderViewer *CaptureContext::ViewShader(const ShaderReflection *shader, Resour
 IShaderMessageViewer *CaptureContext::ViewShaderMessages(ShaderStageMask stages)
 {
   return new ShaderMessageViewer(*this, stages, m_MainWindow);
+}
+
+IDescriptorViewer *CaptureContext::ViewDescriptorStore(ResourceId id)
+{
+  DescriptorViewer *viewer = new DescriptorViewer(*this, m_MainWindow);
+
+  viewer->ViewDescriptorStore(id);
+
+  return viewer;
+}
+
+IDescriptorViewer *CaptureContext::ViewDescriptors(const rdcarray<Descriptor> &descriptors,
+                                                   const rdcarray<SamplerDescriptor> &samplerDescriptors)
+{
+  DescriptorViewer *viewer = new DescriptorViewer(*this, m_MainWindow);
+
+  viewer->ViewDescriptors(descriptors, samplerDescriptors);
+
+  return viewer;
 }
 
 IBufferViewer *CaptureContext::ViewBuffer(uint64_t byteOffset, uint64_t byteSize, ResourceId id,
@@ -2779,10 +2802,19 @@ void CaptureContext::AddDockWindow(QWidget *newWindow, DockReference ref, QWidge
       BufferViewer *cb = BufferViewer::GetFirstCBufferView(buf);
       if(cb)
       {
-        manager->addToolWindow(newWindow, ToolWindowManager::AreaReference(ToolWindowManager::AddTo,
-                                                                           manager->areaOf(cb)));
+        if(manager->areaOf(buf) == NULL)
+          manager->addToolWindow(newWindow, ToolWindowManager::AreaReference(
+                                                ToolWindowManager::AddTo, manager->areaOf(cb)));
+        else
+          manager->moveToolWindow(newWindow, ToolWindowManager::AreaReference(
+                                                 ToolWindowManager::AddTo, manager->areaOf(cb)));
         return;
       }
+
+      // if we're re-adding the same cbuffer view again and it's the only one open, just leave it
+      // where it is without changing anything.
+      if(BufferViewer::GetFirstCBufferView(NULL) == buf && manager->areaOf(buf) != NULL)
+        return;
     }
 
     if(qobject_cast<PixelHistoryView *>(newWindow))

@@ -166,6 +166,11 @@ void VkMarkerRegion::End(VkQueue q)
 }
 
 template <>
+VkObjectType objType<VkBuffer>()
+{
+  return VK_OBJECT_TYPE_BUFFER;
+}
+template <>
 VkObjectType objType<VkImage>()
 {
   return VK_OBJECT_TYPE_IMAGE;
@@ -362,6 +367,10 @@ bool VkInitParams::IsSupportedVersion(uint64_t ver)
   if(ver == CurrentVersion)
     return true;
 
+  // 0x15 -> 0x16 - added support for acceleration structures
+  if(ver == 0x15)
+    return true;
+
   // 0x14 -> 0x15 - added support for mutable descriptors
   if(ver == 0x14)
     return true;
@@ -543,6 +552,12 @@ int StageIndex(VkShaderStageFlagBits stageFlag)
     case VK_SHADER_STAGE_COMPUTE_BIT: return 5;
     case VK_SHADER_STAGE_TASK_BIT_EXT: return 6;
     case VK_SHADER_STAGE_MESH_BIT_EXT: return 7;
+    case VK_SHADER_STAGE_RAYGEN_BIT_KHR: return 8;
+    case VK_SHADER_STAGE_INTERSECTION_BIT_KHR: return 9;
+    case VK_SHADER_STAGE_ANY_HIT_BIT_KHR: return 10;
+    case VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR: return 11;
+    case VK_SHADER_STAGE_MISS_BIT_KHR: return 12;
+    case VK_SHADER_STAGE_CALLABLE_BIT_KHR: return 13;
     default: RDCERR("Unrecognised/not single flag %x", stageFlag); break;
   }
 
@@ -560,7 +575,15 @@ VkShaderStageFlags ShaderMaskFromIndex(size_t index)
       VK_SHADER_STAGE_COMPUTE_BIT,
       VK_SHADER_STAGE_TASK_BIT_EXT,
       VK_SHADER_STAGE_MESH_BIT_EXT,
+      VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+      VK_SHADER_STAGE_INTERSECTION_BIT_KHR,
+      VK_SHADER_STAGE_ANY_HIT_BIT_KHR,
+      VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR,
+      VK_SHADER_STAGE_MISS_BIT_KHR,
+      VK_SHADER_STAGE_CALLABLE_BIT_KHR,
   };
+
+  RDCCOMPILE_ASSERT(ARRAY_COUNT(mask) == NumShaderStages, "Array is out of date");
 
   if(index < ARRAY_COUNT(mask))
     return mask[index];
@@ -881,9 +904,9 @@ rdcstr HumanDriverName(VkDriverId driverId)
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY: return "NVIDIA Proprietary";
     case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS: return "Intel Proprietary";
     case VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA: return "Intel Open-source";
-    case VK_DRIVER_ID_IMAGINATION_PROPRIETARY: return "NVIDIA Proprietary";
-    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY: return "NVIDIA Proprietary";
-    case VK_DRIVER_ID_ARM_PROPRIETARY: return "NVIDIA Proprietary";
+    case VK_DRIVER_ID_IMAGINATION_PROPRIETARY: return "Imagination Proprietary";
+    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY: return "Qualcomm Proprietary";
+    case VK_DRIVER_ID_ARM_PROPRIETARY: return "Arm Proprietary";
     case VK_DRIVER_ID_GOOGLE_SWIFTSHADER: return "Swiftshader";
     case VK_DRIVER_ID_GGP_PROPRIETARY: return "GGP Proprietary";
     case VK_DRIVER_ID_BROADCOM_PROPRIETARY: return "Broadcom Proprietary";
@@ -900,7 +923,8 @@ rdcstr HumanDriverName(VkDriverId driverId)
     case VK_DRIVER_ID_MESA_DOZEN: return "Mesa Dozen";
     case VK_DRIVER_ID_MESA_NVK: return "Mesa NVK";
     case VK_DRIVER_ID_IMAGINATION_OPEN_SOURCE_MESA: return "Imagination Open-source";
-    case VK_DRIVER_ID_MESA_AGXV: return "Mesa AGXV";
+    case VK_DRIVER_ID_MESA_HONEYKRISP: return "Mesa Honeykrisp";
+    case VK_DRIVER_ID_RESERVED_27: return "<Unknown>";
     case VK_DRIVER_ID_MAX_ENUM: break;
   }
 
@@ -1154,6 +1178,19 @@ VkDriverInfo::VkDriverInfo(const VkPhysicalDeviceProperties &physProps,
       qualcommLeakingUBOOffsets = true;
     }
   }
+
+  if(driverProps.driverID == VK_DRIVER_ID_ARM_PROPRIETARY)
+  {
+    if(Major() >= 36 && Major() < 43)
+    {
+      if(active)
+        RDCLOG(
+            "Using host acceleration structure deserialisation commands on Mali - update to a "
+            "newer "
+            "driver for fix");
+      maliBrokenASDeviceSerialisation = true;
+    }
+  }
 }
 
 FrameRefType GetRefType(DescriptorSlotType descType)
@@ -1168,7 +1205,8 @@ FrameRefType GetRefType(DescriptorSlotType descType)
     case DescriptorSlotType::UniformBuffer:
     case DescriptorSlotType::UniformBufferDynamic:
     case DescriptorSlotType::InputAttachment:
-    case DescriptorSlotType::InlineBlock: return eFrameRef_Read;
+    case DescriptorSlotType::InlineBlock:
+    case DescriptorSlotType::AccelerationStructure: return eFrameRef_Read;
     case DescriptorSlotType::StorageImage:
     case DescriptorSlotType::StorageTexelBuffer:
     case DescriptorSlotType::StorageBuffer:
@@ -1205,6 +1243,13 @@ void DescriptorSetSlot::SetTexelBuffer(VkDescriptorType writeType, ResourceId id
 {
   type = convert(writeType);
   resource = id;
+}
+
+void DescriptorSetSlot::SetAccelerationStructure(VkDescriptorType writeType,
+                                                 VkAccelerationStructureKHR accelerationStructure)
+{
+  type = convert(writeType);
+  resource = GetResID(accelerationStructure);
 }
 
 void AddBindFrameRef(DescriptorBindRefs &refs, ResourceId id, FrameRefType ref)
@@ -1263,7 +1308,7 @@ void DescriptorSetSlot::AccumulateBindRefs(DescriptorBindRefs &refs, VulkanResou
   RDCCOMPILE_ASSERT(offsetof(DescriptorSetSlot, offset) == 8,
                     "DescriptorSetSlot first uint64_t bitpacking isn't working as expected");
 
-  VkResourceRecord *bufView = NULL, *imgView = NULL, *buffer = NULL;
+  VkResourceRecord *bufView = NULL, *imgView = NULL, *buffer = NULL, *accStruct = NULL;
 
   switch(type)
   {
@@ -1277,6 +1322,9 @@ void DescriptorSetSlot::AccumulateBindRefs(DescriptorBindRefs &refs, VulkanResou
     case DescriptorSlotType::SampledImage:
     case DescriptorSlotType::StorageImage:
     case DescriptorSlotType::InputAttachment: imgView = rm->GetResourceRecord(resource); break;
+    case DescriptorSlotType::AccelerationStructure:
+      accStruct = rm->GetResourceRecord(resource);
+      break;
     default: break;
   }
 
@@ -1311,6 +1359,10 @@ void DescriptorSetSlot::AccumulateBindRefs(DescriptorBindRefs &refs, VulkanResou
       AddMemFrameRef(refs, buffer->baseResource, buffer->memOffset, buffer->memSize, ref);
     if(buffer->storable)
       refs.storableRefs.insert(buffer);
+  }
+  if(accStruct)
+  {
+    AddBindFrameRef(refs, resource, eFrameRef_Read);
   }
 }
 

@@ -34,6 +34,8 @@
 #define float2 Vec2f
 #define float3 Vec3f
 #define uint4 Vec4u
+#define uint3 Vec3u
+#define uint2 Vec2u
 #define int4 Vec4i
 #define float4 Vec4f
 #define float4x4 Matrix4f
@@ -195,8 +197,76 @@ cbuffer AccStructPatchInfo REG(b0)
   uint addressCount;
 };
 
-#if defined(SHADER_MODEL_MIN_6_0_REQUIRED) || defined(__cplusplus)
+  // INCLUDE_GPUADDRESS_HELPERS should only be set for unit tests to check these functions below,
+  // otherwise it pollutes the interface
+
+#if defined(__cplusplus) && !defined(INCLUDE_GPUADDRESS_HELPERS)
+// on the GPU this will be uint2 {.x = LSB, .y = MSB} to match uint64 order
 typedef uint64_t GPUAddress;
+#else
+typedef uint2 GPUAddress;
+#endif
+
+// don't define the helpers in C++ by default, unless we're using them for unit tests
+#if !defined(__cplusplus) || defined(INCLUDE_GPUADDRESS_HELPERS)
+
+#if defined(__cplusplus)
+#define max RDCMAX
+#define min RDCMIN
+#endif
+
+bool lessThan(GPUAddress a, GPUAddress b)
+{
+  // either MSB is less, or MSB is equal and LSB is less-equal
+  return a.y < b.y || (a.y == b.y && a.x < b.x);
+}
+
+bool lessEqual(GPUAddress a, GPUAddress b)
+{
+  return lessThan(a, b) || (a.y == b.y && a.x == b.x);
+}
+
+GPUAddress add(GPUAddress a, GPUAddress b)
+{
+  uint msb = 0, lsb = 0;
+  if(b.x > 0 && a.x > 0xffffffff - b.x)
+  {
+    uint x = max(a.x, b.x) - 0x80000000;
+    uint y = min(a.x, b.x);
+
+    uint sum = x + y;
+
+    msb = a.y + b.y + 1;
+    lsb = sum - 0x80000000;
+  }
+  else
+  {
+    msb = a.y + b.y;
+    lsb = a.x + b.x;
+  }
+
+  return GPUAddress(lsb, msb);
+}
+
+GPUAddress sub(GPUAddress a, GPUAddress b)
+{
+  uint msb = 0, lsb = 0;
+  if(a.x < b.x)
+  {
+    uint diff = b.x - a.x;
+
+    msb = a.y - b.y - 1;
+    lsb = 0xffffffff - (diff - 1);
+  }
+  else
+  {
+    msb = a.y - b.y;
+    lsb = a.x - b.x;
+  }
+
+  return GPUAddress(lsb, msb);
+}
+#endif
 
 struct BlasAddressRange
 {
@@ -213,10 +283,83 @@ struct BlasAddressPair
 // This corresponds to D3D12_RAYTRACING_INSTANCE_DESC structure
 struct InstanceDesc
 {
-  uint64_t padding[7];
+  uint2 padding[7];
   GPUAddress blasAddress;
 };
-#endif
+
+cbuffer RayDispatchPatchCB REG(b0)
+{
+  // declare GPUAddresses first to avoid padding/alignment issues
+  GPUAddress wrapped_sampHeapBase;
+  GPUAddress wrapped_srvHeapBase;
+
+  GPUAddress unwrapped_sampHeapBase;
+  GPUAddress unwrapped_srvHeapBase;
+
+  uint wrapped_sampHeapSize;
+  uint wrapped_srvHeapSize;
+  uint unwrapped_heapStrides;    // LSB = sampler, MSB = srv
+
+  uint numPatchingAddrs;
+};
+
+cbuffer RayDispatchShaderRecordCB REG(b1)
+{
+  uint shaderrecord_stride;
+  uint shaderrecord_count;
+};
+
+struct StateObjectLookup
+{
+  uint2 id;    // ResourceId
+  uint offset;
+
+  uint pad;
+};
+
+struct ShaderRecordData
+{
+  uint4 identifier[2];    // 32-byte real identifier
+  uint rootSigIndex;      // only lower 16-bits are valid
+};
+
+#define RECORD_PATCH_THREADS 32
+
+#define MAX_LOCALSIG_PARAMS 31
+
+struct LocalRootSigData
+{
+  uint numParams;
+  uint paramOffsets[MAX_LOCALSIG_PARAMS];
+};
+
+#define WRAPPED_DESCRIPTOR_STRIDE 64
+
+cbuffer RayIndirectDispatchCB REG(b0)
+{
+  GPUAddress scratchBuffer;
+
+  uint commandSigDispatchOffset;
+  uint commandSigStride;
+  uint commandSigSize;
+  uint maxCommandCount;    // MaxCommandCount to clamp to. We also set the top bit if there is no count buffer
+};
+
+struct PatchingExecute
+{
+  // D3D12PatchRayDispatchParam::RecordCB
+  uint shaderrecord_stride;
+  uint shaderrecord_count;
+  // D3D12PatchRayDispatchParam::SourceBuffer
+  GPUAddress sourceData;
+  // D3D12PatchRayDispatchParam::DestBuffer
+  GPUAddress destData;
+  // Dispatch itself
+  uint3 dispatchDim;
+  uint padding1;
+
+  uint2 padding2;
+};
 
 cbuffer DebugSampleOperation REG(b0)
 {
@@ -232,25 +375,25 @@ cbuffer DebugSampleOperation REG(b0)
   float debugSampleLodCompare;
 };
 
-#define DEBUG_SAMPLE_MATH_RCP 129
-#define DEBUG_SAMPLE_MATH_RSQ 68
-#define DEBUG_SAMPLE_MATH_EXP 25
-#define DEBUG_SAMPLE_MATH_LOG 47
-#define DEBUG_SAMPLE_MATH_SINCOS 77
+#define DEBUG_SAMPLE_MATH_DXBC_RCP 1000
+#define DEBUG_SAMPLE_MATH_DXBC_RSQ 1001
+#define DEBUG_SAMPLE_MATH_DXBC_EXP 1002
+#define DEBUG_SAMPLE_MATH_DXBC_LOG 1003
+#define DEBUG_SAMPLE_MATH_DXBC_SINCOS 1004
 
-#define DEBUG_SAMPLE_TEX_SAMPLE 69
-#define DEBUG_SAMPLE_TEX_SAMPLE_L 72
-#define DEBUG_SAMPLE_TEX_SAMPLE_B 74
-#define DEBUG_SAMPLE_TEX_SAMPLE_D 73
-#define DEBUG_SAMPLE_TEX_SAMPLE_C 70
-#define DEBUG_SAMPLE_TEX_SAMPLE_C_LZ 71
-#define DEBUG_SAMPLE_TEX_GATHER4 109
-#define DEBUG_SAMPLE_TEX_GATHER4_C 126
-#define DEBUG_SAMPLE_TEX_GATHER4_PO 127
-#define DEBUG_SAMPLE_TEX_GATHER4_PO_C 128
-#define DEBUG_SAMPLE_TEX_LOD 108
-#define DEBUG_SAMPLE_TEX_LD 45
-#define DEBUG_SAMPLE_TEX_LD_MS 46
+#define DEBUG_SAMPLE_TEX_SAMPLE 100
+#define DEBUG_SAMPLE_TEX_SAMPLE_LEVEL 101
+#define DEBUG_SAMPLE_TEX_SAMPLE_BIAS 102
+#define DEBUG_SAMPLE_TEX_SAMPLE_GRAD 103
+#define DEBUG_SAMPLE_TEX_SAMPLE_CMP 104
+#define DEBUG_SAMPLE_TEX_SAMPLE_CMP_LEVEL_ZERO 105
+#define DEBUG_SAMPLE_TEX_GATHER4 106
+#define DEBUG_SAMPLE_TEX_GATHER4_CMP 107
+#define DEBUG_SAMPLE_TEX_GATHER4_PO 108
+#define DEBUG_SAMPLE_TEX_GATHER4_PO_CMP 109
+#define DEBUG_SAMPLE_TEX_LOD 110
+#define DEBUG_SAMPLE_TEX_LOAD 111
+#define DEBUG_SAMPLE_TEX_LOAD_MS 112
 
 #define DEBUG_SAMPLE_TEX1D 1
 #define DEBUG_SAMPLE_TEX2D 2
@@ -263,6 +406,20 @@ cbuffer DebugSampleOperation REG(b0)
 #define DEBUG_SAMPLE_INT 3
 #define DEBUG_SAMPLE_UINT 4
 #define DEBUG_SAMPLE_FLOAT 5
+
+#define DEBUG_SAMPLE_MATH_DXIL_COS 10000
+#define DEBUG_SAMPLE_MATH_DXIL_SIN 10001
+#define DEBUG_SAMPLE_MATH_DXIL_TAN 10002
+#define DEBUG_SAMPLE_MATH_DXIL_ACOS 10003
+#define DEBUG_SAMPLE_MATH_DXIL_ASIN 10004
+#define DEBUG_SAMPLE_MATH_DXIL_ATAN 10005
+#define DEBUG_SAMPLE_MATH_DXIL_HCOS 10006
+#define DEBUG_SAMPLE_MATH_DXIL_HSIN 10007
+#define DEBUG_SAMPLE_MATH_DXIL_HTAN 10008
+#define DEBUG_SAMPLE_MATH_DXIL_EXP 10009
+#define DEBUG_SAMPLE_MATH_DXIL_LOG 10010
+#define DEBUG_SAMPLE_MATH_DXIL_SQRT 10011
+#define DEBUG_SAMPLE_MATH_DXIL_RSQRT 10012
 
 // some constants available to both C++ and HLSL for configuring display
 #define CUBEMAP_FACE_RIGHT 0

@@ -1365,6 +1365,134 @@ bool RichTextViewDelegate::linkHover(QMouseEvent *e, const QFont &font, const QM
   return false;
 }
 
+ButtonDelegate::ButtonDelegate(const QIcon &icon, QString text, QWidget *parent)
+    : m_Icon(icon), m_Text(text), QStyledItemDelegate(parent)
+{
+}
+
+void ButtonDelegate::paint(QPainter *painter, const QStyleOptionViewItem &option,
+                           const QModelIndex &index) const
+{
+  if(m_VisibleRole != -1 && index.data(m_VisibleRole) != m_VisibleValue)
+    return QStyledItemDelegate::paint(painter, option, index);
+
+  // draw the background to get selection etc
+  QApplication::style()->drawControl(QStyle::CE_ItemViewItem, &option, painter);
+
+  QStyleOptionButton button;
+
+  button.text = m_Text;
+  button.icon = m_Icon;
+
+  if(m_EnableRole == -1 || index.data(m_EnableRole) == m_EnableValue)
+    button.state = QStyle::State_Enabled;
+
+  if(m_ClickedIndex == index)
+    button.state |= QStyle::State_Sunken;
+
+  QSize sz =
+      QApplication::style()->sizeFromContents(QStyle::CT_PushButton, &button, option.decorationSize);
+
+  button.rect = getButtonRect(option.rect, sz);
+  button.iconSize = option.decorationSize;
+
+  QApplication::style()->drawControl(QStyle::CE_PushButton, &button, painter);
+}
+
+QSize ButtonDelegate::sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const
+{
+  if(m_VisibleRole != -1 && index.data(m_VisibleRole) != m_VisibleValue)
+    return QStyledItemDelegate::sizeHint(option, index);
+
+  QStyleOptionButton button;
+  button.text = m_Text;
+  button.icon = m_Icon;
+  button.state = QStyle::State_Enabled;
+
+  return QApplication::style()->sizeFromContents(QStyle::CT_PushButton, &button,
+                                                 option.decorationSize);
+}
+
+bool ButtonDelegate::editorEvent(QEvent *event, QAbstractItemModel *model,
+                                 const QStyleOptionViewItem &option, const QModelIndex &index)
+{
+  if(m_VisibleRole != -1 && index.data(m_VisibleRole) != m_VisibleValue)
+    return QStyledItemDelegate::editorEvent(event, model, option, index);
+
+  if(event->type() == QEvent::MouseButtonPress)
+  {
+    QMouseEvent *e = (QMouseEvent *)event;
+
+    QPoint p = e->pos();
+
+    QSize sz = sizeHint(option, index);
+    QRect rect = getButtonRect(option.rect, sz);
+
+    if(rect.contains(p) && (m_EnableRole == -1 || index.data(m_EnableRole) == m_EnableValue))
+    {
+      m_ClickedIndex = index;
+      return true;
+    }
+  }
+  else if(event->type() == QEvent::MouseMove)
+  {
+    QMouseEvent *e = (QMouseEvent *)event;
+
+    if(m_ClickedIndex != index || (e->buttons() & Qt::LeftButton) == 0)
+    {
+      m_ClickedIndex = QModelIndex();
+    }
+    else
+    {
+      QPoint p = e->pos();
+
+      QSize sz = sizeHint(option, index);
+      QRect rect = getButtonRect(option.rect, sz);
+
+      if(!rect.contains(p))
+      {
+        m_ClickedIndex = QModelIndex();
+      }
+    }
+  }
+  else if(event->type() == QEvent::MouseButtonRelease)
+  {
+    if(m_ClickedIndex == index && index != QModelIndex())
+    {
+      m_ClickedIndex = QModelIndex();
+
+      QMouseEvent *e = (QMouseEvent *)event;
+
+      QPoint p = e->pos();
+
+      QSize sz = sizeHint(option, index);
+      QRect rect = getButtonRect(option.rect, sz);
+
+      if(rect.contains(p))
+      {
+        emit messageClicked(index);
+        return true;
+      }
+    }
+  }
+
+  return QStyledItemDelegate::editorEvent(event, model, option, index);
+}
+
+QRect ButtonDelegate::getButtonRect(const QRect boundsRect, const QSize sz) const
+{
+  QRect rect = boundsRect;
+  rect.setWidth(qMin(rect.width(), sz.width()));
+  rect.setHeight(qMin(rect.height(), sz.height()));
+  if(m_Centered)
+    rect.moveLeft(rect.center().x() - rect.width() / 2);
+  rect.moveTop(rect.center().y() - rect.height() / 2);
+  // clip if the rounding from centering caused us to go out of bounds
+  rect.setTop(qMax(rect.top(), boundsRect.top()));
+  rect.setLeft(qMax(rect.left(), boundsRect.left()));
+  return rect;
+}
+
 #include "renderdoc_tostr.inl"
 
 QString ToQStr(const ResourceUsage usage, const GraphicsAPI apitype)
@@ -1380,11 +1508,11 @@ QString ToQStr(const ResourceUsage usage, const GraphicsAPI apitype)
 
       case ResourceUsage::VS_Constants: return lit("VS - Constant Buffer");
       case ResourceUsage::GS_Constants: return lit("GS - Constant Buffer");
-      case ResourceUsage::HS_Constants: return lit("TCS - Constant Buffer");
-      case ResourceUsage::DS_Constants: return lit("TES - Constant Buffer");
-      case ResourceUsage::PS_Constants: return lit("FS - Constant Buffer");
+      case ResourceUsage::HS_Constants: return lit("HS - Constant Buffer");
+      case ResourceUsage::DS_Constants: return lit("DS - Constant Buffer");
+      case ResourceUsage::PS_Constants: return lit("PS - Constant Buffer");
       case ResourceUsage::CS_Constants: return lit("CS - Constant Buffer");
-      case ResourceUsage::TS_Constants: return lit("TS - Constant Buffer");
+      case ResourceUsage::TS_Constants: return lit("AS - Constant Buffer");
       case ResourceUsage::MS_Constants: return lit("MS - Constant Buffer");
       case ResourceUsage::All_Constants: return lit("All - Constant Buffer");
 
@@ -1392,21 +1520,21 @@ QString ToQStr(const ResourceUsage usage, const GraphicsAPI apitype)
 
       case ResourceUsage::VS_Resource: return lit("VS - Resource");
       case ResourceUsage::GS_Resource: return lit("GS - Resource");
-      case ResourceUsage::HS_Resource: return lit("TCS - Resource");
-      case ResourceUsage::DS_Resource: return lit("TES - Resource");
-      case ResourceUsage::PS_Resource: return lit("FS - Resource");
+      case ResourceUsage::HS_Resource: return lit("HS - Resource");
+      case ResourceUsage::DS_Resource: return lit("DS - Resource");
+      case ResourceUsage::PS_Resource: return lit("PS - Resource");
       case ResourceUsage::CS_Resource: return lit("CS - Resource");
-      case ResourceUsage::TS_Resource: return lit("TS - Resource");
+      case ResourceUsage::TS_Resource: return lit("AS - Resource");
       case ResourceUsage::MS_Resource: return lit("MS - Resource");
       case ResourceUsage::All_Resource: return lit("All - Resource");
 
       case ResourceUsage::VS_RWResource: return lit("VS - UAV");
-      case ResourceUsage::HS_RWResource: return lit("TCS - UAV");
-      case ResourceUsage::DS_RWResource: return lit("TES - UAV");
+      case ResourceUsage::HS_RWResource: return lit("HS - UAV");
+      case ResourceUsage::DS_RWResource: return lit("DS - UAV");
       case ResourceUsage::GS_RWResource: return lit("GS - UAV");
-      case ResourceUsage::PS_RWResource: return lit("FS - UAV");
+      case ResourceUsage::PS_RWResource: return lit("PS - UAV");
       case ResourceUsage::CS_RWResource: return lit("CS - UAV");
-      case ResourceUsage::TS_RWResource: return lit("TS - UAV");
+      case ResourceUsage::TS_RWResource: return lit("AS - UAV");
       case ResourceUsage::MS_RWResource: return lit("MS - UAV");
       case ResourceUsage::All_RWResource: return lit("All - UAV");
 
@@ -1445,9 +1573,9 @@ QString ToQStr(const ResourceUsage usage, const GraphicsAPI apitype)
 
       case ResourceUsage::VS_Constants: return lit("VS - Uniform Buffer");
       case ResourceUsage::GS_Constants: return lit("GS - Uniform Buffer");
-      case ResourceUsage::HS_Constants: return lit("HS - Uniform Buffer");
-      case ResourceUsage::DS_Constants: return lit("DS - Uniform Buffer");
-      case ResourceUsage::PS_Constants: return lit("PS - Uniform Buffer");
+      case ResourceUsage::HS_Constants: return lit("TCS - Uniform Buffer");
+      case ResourceUsage::DS_Constants: return lit("TES - Uniform Buffer");
+      case ResourceUsage::PS_Constants: return lit("FS - Uniform Buffer");
       case ResourceUsage::CS_Constants: return lit("CS - Uniform Buffer");
       case ResourceUsage::TS_Constants: return lit("TS - Uniform Buffer");
       case ResourceUsage::MS_Constants: return lit("MS - Uniform Buffer");
@@ -1457,9 +1585,9 @@ QString ToQStr(const ResourceUsage usage, const GraphicsAPI apitype)
 
       case ResourceUsage::VS_Resource: return lit("VS - Texture");
       case ResourceUsage::GS_Resource: return lit("GS - Texture");
-      case ResourceUsage::HS_Resource: return lit("HS - Texture");
-      case ResourceUsage::DS_Resource: return lit("DS - Texture");
-      case ResourceUsage::PS_Resource: return lit("PS - Texture");
+      case ResourceUsage::HS_Resource: return lit("TCS - Texture");
+      case ResourceUsage::DS_Resource: return lit("TES - Texture");
+      case ResourceUsage::PS_Resource: return lit("FS - Texture");
       case ResourceUsage::CS_Resource: return lit("CS - Texture");
       case ResourceUsage::TS_Resource: return lit("TS - Texture");
       case ResourceUsage::MS_Resource: return lit("MS - Texture");
@@ -1467,9 +1595,9 @@ QString ToQStr(const ResourceUsage usage, const GraphicsAPI apitype)
 
       case ResourceUsage::VS_RWResource: return lit("VS - Image/SSBO");
       case ResourceUsage::HS_RWResource: return lit("HS - Image/SSBO");
-      case ResourceUsage::DS_RWResource: return lit("DS - Image/SSBO");
-      case ResourceUsage::GS_RWResource: return lit("GS - Image/SSBO");
-      case ResourceUsage::PS_RWResource: return lit("PS - Image/SSBO");
+      case ResourceUsage::DS_RWResource: return lit("TCS - Image/SSBO");
+      case ResourceUsage::GS_RWResource: return lit("TES - Image/SSBO");
+      case ResourceUsage::PS_RWResource: return lit("FS - Image/SSBO");
       case ResourceUsage::CS_RWResource: return lit("CS - Image/SSBO");
       case ResourceUsage::TS_RWResource: return lit("TS - Image/SSBO");
       case ResourceUsage::MS_RWResource: return lit("MS - Image/SSBO");
@@ -1517,6 +1645,12 @@ QString ToQStr(const ShaderStage stage, const GraphicsAPI apitype)
       case ShaderStage::Compute: return lit("Compute");
       case ShaderStage::Amplification: return lit("Amplif.");
       case ShaderStage::Mesh: return lit("Mesh");
+      case ShaderStage::RayGen: return lit("RayGen");
+      case ShaderStage::Intersection: return lit("Intersection");
+      case ShaderStage::AnyHit: return lit("AnyHit");
+      case ShaderStage::ClosestHit: return lit("ClosestHit");
+      case ShaderStage::Miss: return lit("Miss");
+      case ShaderStage::Callable: return lit("Callable");
       default: break;
     }
   }
@@ -1532,6 +1666,12 @@ QString ToQStr(const ShaderStage stage, const GraphicsAPI apitype)
       case ShaderStage::Compute: return lit("Compute");
       case ShaderStage::Task: return lit("Task");
       case ShaderStage::Mesh: return lit("Mesh");
+      case ShaderStage::RayGen: return lit("RayGen");
+      case ShaderStage::Intersection: return lit("Intersection");
+      case ShaderStage::AnyHit: return lit("AnyHit");
+      case ShaderStage::ClosestHit: return lit("ClosestHit");
+      case ShaderStage::Miss: return lit("Miss");
+      case ShaderStage::Callable: return lit("Callable");
       default: break;
     }
   }
@@ -3682,4 +3822,16 @@ QVariant StructuredDataItemModel::data(const QModelIndex &index, int role) const
   }
 
   return QVariant();
+}
+
+QRClickToolButton::QRClickToolButton(QWidget *parent) : QToolButton(parent)
+{
+}
+
+void QRClickToolButton::mousePressEvent(QMouseEvent *e)
+{
+  if(e->button() == Qt::RightButton)
+    emit rightClicked();
+  else
+    QToolButton::mousePressEvent(e);
 }

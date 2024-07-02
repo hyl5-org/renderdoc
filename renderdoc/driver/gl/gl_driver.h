@@ -220,6 +220,8 @@ private:
   ResourceId m_ContextResourceID;
   GLResourceRecord *m_ContextRecord;
 
+  ResourceId m_DescriptorsID;
+
   GLResourceManager *m_ResourceManager;
 
   uint64_t m_TimeBase = 0;
@@ -603,9 +605,10 @@ private:
   // many drivers will still try to access memory via legacy behaviour even on core profile.
   bool Check_SafeDraw(bool indexed);
 
-  void StoreCompressedTexData(ResourceId texId, GLenum target, GLint level, GLint xoffset,
-                              GLint yoffset, GLint zoffset, GLsizei width, GLsizei height,
-                              GLsizei depth, GLenum format, GLsizei imageSize, const void *pixels);
+  void StoreCompressedTexData(ResourceId texId, GLenum target, GLint level, bool subUpdate,
+                              GLint xoffset, GLint yoffset, GLint zoffset, GLsizei width,
+                              GLsizei height, GLsizei depth, GLenum format, GLsizei imageSize,
+                              const void *pixels);
 
   // no copy semantics
   WrappedOpenGL(const WrappedOpenGL &);
@@ -733,9 +736,6 @@ public:
     rdcarray<uint32_t> specIDs;
     rdcarray<uint32_t> specValues;
 
-    // pre-calculated bindpoint mapping for SPIR-V shaders. NOT valid for normal GLSL shaders
-    ShaderBindpointMapping mapping;
-
     void ProcessCompilation(WrappedOpenGL &drv, ResourceId id, GLuint realShader);
     void ProcessSPIRVCompilation(WrappedOpenGL &drv, ResourceId id, GLuint realShader,
                                  const GLchar *pEntryPoint, GLuint numSpecializationConstants,
@@ -795,7 +795,6 @@ public:
       if(shadId != ResourceId())
       {
         stages.refls[i] = m_Shaders[shadId].reflection;
-        stages.mappings[i] = &m_Shaders[shadId].mapping;
       }
     }
   }

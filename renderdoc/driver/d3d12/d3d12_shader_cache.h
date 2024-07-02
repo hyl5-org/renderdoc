@@ -58,9 +58,12 @@ public:
   };
   ID3DBlob *MakeFixedColShader(FixedColVariant variant, bool dxil = false);
   ID3DBlob *GetQuadShaderDXILBlob();
+  ID3DBlob *GetPrimitiveIDShaderDXILBlob();
+  ID3DBlob *GetFixedColorShaderDXILBlob(uint32_t variant);
 
   void LoadDXC();
 
+  void SetDevConfiguration(D3D12DevConfiguration *config) { m_DevConfig = config; }
   void SetCaching(bool enabled) { m_CacheShaders = enabled; }
 private:
   static const uint32_t m_ShaderCacheMagic = 0xf000baba;
@@ -70,6 +73,8 @@ private:
 
   bool m_ShaderCacheDirty = false, m_CacheShaders = false;
   std::map<uint32_t, ID3DBlob *> m_ShaderCache;
+
+  D3D12DevConfiguration *m_DevConfig = NULL;
 
   D3D12_STATIC_SAMPLER_DESC1 Upconvert(const D3D12_STATIC_SAMPLER_DESC &StaticSampler);
   D3D12_STATIC_SAMPLER_DESC Downconvert(const D3D12_STATIC_SAMPLER_DESC1 &StaticSampler);

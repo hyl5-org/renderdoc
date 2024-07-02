@@ -137,6 +137,7 @@ struct D3D12_SHADER_RESOURCE_VIEW_DESC_SQUEEZED
   union
   {
     D3D12_BUFFER_SRV Buffer;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV AS;
     D3D12_TEX1D_SRV Texture1D;
     D3D12_TEX1D_ARRAY_SRV Texture1DArray;
     D3D12_TEX2D_SRV Texture2D;
@@ -157,6 +158,8 @@ struct D3D12_SHADER_RESOURCE_VIEW_DESC_SQUEEZED
     // D3D12_TEX2D_ARRAY_SRV should be the largest component, so we can copy it and ensure we've
     // copied the rest.
     RDCCOMPILE_ASSERT(sizeof(Buffer) <= sizeof(Texture2DArray),
+                      "Texture2DArray isn't largest union member!");
+    RDCCOMPILE_ASSERT(sizeof(AS) <= sizeof(Texture2DArray),
                       "Texture2DArray isn't largest union member!");
     RDCCOMPILE_ASSERT(sizeof(Texture1D) <= sizeof(Texture2DArray),
                       "Texture2DArray isn't largest union member!");
@@ -573,50 +576,31 @@ class D3D12GpuBufferAllocator;
 
 struct D3D12GpuBuffer
 {
-  D3D12GpuBuffer()
-      : m_alignedAddress(0),
-        m_offset(0),
-        m_alignment(0),
-        m_addressContentSize(0),
-        m_heapType(D3D12GpuBufferHeapType::UnInitialized),
-        m_heapMemory(D3D12GpuBufferHeapMemoryFlag::UnInitialized),
-        m_resource(NULL)
-  {
-  }
-
-  D3D12GpuBuffer(D3D12GpuBufferHeapType heapType, D3D12GpuBufferHeapMemoryFlag heapMemory,
-                 uint64_t size, uint64_t alignment, D3D12_GPU_VIRTUAL_ADDRESS alignedAddress,
-                 ID3D12Resource *resource)
+  D3D12GpuBuffer(D3D12GpuBufferAllocator &alloc, D3D12GpuBufferHeapType heapType,
+                 D3D12GpuBufferHeapMemoryFlag heapMemory, uint64_t size, uint64_t alignment,
+                 D3D12_GPU_VIRTUAL_ADDRESS alignedAddress, ID3D12Resource *resource)
       : m_alignedAddress(alignedAddress),
         m_offset(0),
         m_alignment(alignment),
         m_addressContentSize(size),
         m_heapType(heapType),
         m_heapMemory(heapMemory),
-        m_resource(resource)
+        m_resource(resource),
+        m_Allocator(alloc)
   {
+    m_RefCount = 1;
     if(m_resource)
     {
       m_offset = alignedAddress - m_resource->GetGPUVirtualAddress();
     }
   }
 
-  D3D12GpuBufferHeapType HeapType() const { return m_heapType; }
-  D3D12_HEAP_TYPE GetD3D12HeapType() const
-  {
-    switch(m_heapType)
-    {
-      case D3D12GpuBufferHeapType::AccStructDefaultHeap:
-      case D3D12GpuBufferHeapType::DefaultHeap:
-      case D3D12GpuBufferHeapType::DefaultHeapWithUav: return D3D12_HEAP_TYPE_DEFAULT;
-      case D3D12GpuBufferHeapType::ReadBackHeap: return D3D12_HEAP_TYPE_READBACK;
-      case D3D12GpuBufferHeapType::UploadHeap: return D3D12_HEAP_TYPE_UPLOAD;
-      case D3D12GpuBufferHeapType::CustomHeapWithUavCpuAccess: return D3D12_HEAP_TYPE_CUSTOM;
-      default: RDCERR("Unhandled/Invalid type");
-    }
+  // disable copying, these should be passed via pointer so the refcounting works as expected
+  D3D12GpuBuffer(const D3D12GpuBuffer &) = delete;
+  D3D12GpuBuffer(D3D12GpuBuffer &&) = delete;
+  D3D12GpuBuffer &operator=(const D3D12GpuBuffer &) = delete;
 
-    return D3D12_HEAP_TYPE_DEFAULT;
-  }
+  D3D12GpuBufferHeapType HeapType() const { return m_heapType; }
   bool operator!=(const D3D12GpuBuffer &other) const { return !(*this == other); }
   bool operator==(const D3D12GpuBuffer &other) const
   {
@@ -637,13 +621,26 @@ struct D3D12GpuBuffer
   uint64_t Size() const { return m_addressContentSize; }
   D3D12_GPU_VIRTUAL_ADDRESS Address() const { return m_alignedAddress; }
   uint64_t Alignment() const { return m_alignment; }
-  bool Release();
+  void AddRef();
+  void Release();
   D3D12GpuBufferHeapMemoryFlag HeapMemory() const { return m_heapMemory; }
+
+  void *Map(D3D12_RANGE *pReadRange = NULL)
+  {
+    byte *ret = NULL;
+    if(FAILED(m_resource->Map(0, pReadRange, (void **)&ret)))
+      return NULL;
+    ret += m_offset;
+    return ret;
+  }
+  void Unmap(D3D12_RANGE *pWrittenRange = NULL) { m_resource->Unmap(0, pWrittenRange); }
 private:
+  unsigned int m_RefCount;
   D3D12_GPU_VIRTUAL_ADDRESS m_alignedAddress;
   uint64_t m_offset;
   uint64_t m_alignment;
   uint64_t m_addressContentSize;
+  D3D12GpuBufferAllocator &m_Allocator;
   D3D12GpuBufferHeapType m_heapType;
   D3D12GpuBufferHeapMemoryFlag m_heapMemory;
   ID3D12Resource *m_resource;
@@ -830,41 +827,21 @@ class WrappedID3D12GraphicsCommandList;
 class D3D12GpuBufferAllocator
 {
 public:
-  static bool Initialize(WrappedID3D12Device *wrappedDevice)
+  D3D12GpuBufferAllocator(WrappedID3D12Device *wrappedDevice) : m_wrappedDevice(wrappedDevice)
   {
-    if(m_bufferAllocator == NULL && wrappedDevice)
-    {
-      m_bufferAllocator = new D3D12GpuBufferAllocator(wrappedDevice);
-    }
-
-    return m_bufferAllocator != NULL;
+    m_totalAllocatedMemoryInUse = 0;
   }
-
-  static D3D12GpuBufferAllocator *Inst() { return m_bufferAllocator; }
-  static bool Destroy()
-  {
-    SAFE_DELETE(m_bufferAllocator);
-    return true;
-  }
-
-  static bool CopyBufferRegion(WrappedID3D12GraphicsCommandList *wrappedCmd,
-                               const D3D12GpuBuffer &destBuffer,
-                               D3D12_GPU_VIRTUAL_ADDRESS srcAddress, uint64_t dataSize);
-
-  static bool CopyBufferRegion(WrappedID3D12GraphicsCommandList *wrappedCmd,
-                               const D3D12GpuBuffer &destBuffer, const D3D12GpuBuffer &sourceBuffer,
-                               uint64_t dataSize);
 
   bool Alloc(D3D12GpuBufferHeapType heapType, D3D12GpuBufferHeapMemoryFlag heapMem, uint64_t size,
-             D3D12GpuBuffer &gpuBuffer)
+             D3D12GpuBuffer **gpuBuffer)
   {
     return Alloc(heapType, heapMem, size, 0, gpuBuffer);
   }
 
   bool Alloc(D3D12GpuBufferHeapType heapType, D3D12GpuBufferHeapMemoryFlag heapMem, uint64_t size,
-             uint64_t alignment, D3D12GpuBuffer &gpuBuffer);
+             uint64_t alignment, D3D12GpuBuffer **gpuBuffer);
 
-  bool Release(const D3D12GpuBuffer &gpuBuffer);
+  void Release(const D3D12GpuBuffer &gpuBuffer);
 
   uint64_t GetAllocatedMemorySize() const { return m_totalAllocatedMemoryInUse; }
   ~D3D12GpuBufferAllocator()
@@ -876,15 +853,13 @@ public:
   }
 
 private:
-  D3D12GpuBufferAllocator(WrappedID3D12Device *wrappedDevice) : m_wrappedDevice(wrappedDevice)
-  {
-    m_totalAllocatedMemoryInUse = 0;
-  }
-
   // Class for handling buffer resources
   class D3D12GpuBufferResource
   {
   public:
+    static bool CreateBufferResource(WrappedID3D12Device *wrappedDevice,
+                                     D3D12GpuBufferHeapType heapType, uint64_t size,
+                                     D3D12GpuBufferResource **bufferResource);
     static bool CreateCommittedResourceBuffer(ID3D12Device *device,
                                               const D3D12_HEAP_PROPERTIES &heapProperty,
                                               D3D12_RESOURCE_STATES initState, uint64_t size,
@@ -992,9 +967,9 @@ private:
     }
 
     bool Alloc(WrappedID3D12Device *wrappedDevice, D3D12GpuBufferHeapMemoryFlag heapMem,
-               uint64_t size, uint64_t alignment, D3D12GpuBuffer &gpuBuffer);
+               uint64_t size, uint64_t alignment, D3D12GpuBuffer **gpuBuffer);
 
-    bool Free(const D3D12GpuBuffer &gpuBuffer);
+    void Free(const D3D12GpuBuffer &gpuBuffer);
 
     static constexpr uint64_t kDefaultWithUavSizeBufferInitSize = 1000ull * 8u;
     static constexpr uint64_t kAccStructBufferPoolInitSize = 1000ull * 256u;
@@ -1005,12 +980,6 @@ private:
     uint64_t m_bufferInitSize;
   };
 
-  static D3D12GpuBufferAllocator *m_bufferAllocator;
-
-  static bool CreateBufferResource(WrappedID3D12Device *wrappedDevice,
-                                   D3D12GpuBufferHeapType heapType, uint64_t size,
-                                   D3D12GpuBufferResource **bufferResource);
-
   Threading::CriticalSection m_bufferAllocLock;
   D3D12GpuBufferPool *m_bufferPoolList[(size_t)D3D12GpuBufferHeapType::Count] = {};
 
@@ -1020,12 +989,36 @@ private:
   uint64_t m_totalAllocatedMemoryInUse;
 };
 
-enum class D3D12PatchAccStructRootParamIndices
+enum class D3D12PatchTLASBuildParam
 {
   RootConstantBuffer,
   RootAddressPairSrv,
   RootPatchedAddressUav,
   Count
+};
+
+enum class D3D12IndirectPrepParam
+{
+  GeneralCB,
+  AppExecuteArgs,
+  AppCount,
+  PatchedExecuteArgs,
+  InternalExecuteArgs,
+  InternalExecuteCount,
+  Count,
+};
+
+enum class D3D12PatchRayDispatchParam
+{
+  GeneralCB,
+  RecordCB,
+  SourceBuffer,
+  DestBuffer,
+  StateObjectData,
+  RecordData,
+  RootSigData,
+  AddrPatchData,
+  Count,
 };
 
 struct D3D12AccStructPatchInfo
@@ -1035,10 +1028,38 @@ struct D3D12AccStructPatchInfo
   ID3D12PipelineState *m_pipeline;
 };
 
+struct PatchedRayDispatch
+{
+  struct Resources
+  {
+    // the lookup buffer
+    D3D12GpuBuffer *lookupBuffer;
+    // the scratch buffer used for patching's fence.
+    D3D12GpuBuffer *patchScratchBuffer;
+    // the argument buffer used for indirect executes.
+    D3D12GpuBuffer *argumentBuffer;
+
+    // for convenience, when these resources are referenced in a queue they get a fence value to
+    // indicate when they're safe to release. This values are unset when returned from patching or
+    // referenced in the list and is set in each queue's copy of the references.
+    UINT64 fenceValue = 0;
+  };
+
+  Resources resources;
+
+  // the patched dispatch descriptor
+  D3D12_DISPATCH_RAYS_DESC desc = {};
+};
+
+struct D3D12ShaderExportDatabase;
+
 class D3D12RaytracingResourceAndUtilHandler
 {
 public:
-  D3D12RaytracingResourceAndUtilHandler(WrappedID3D12Device *device);
+  D3D12RaytracingResourceAndUtilHandler(WrappedID3D12Device *device,
+                                        D3D12GpuBufferAllocator &gpuBufferAllocator);
+
+  void CreateInternalResources();
 
   ID3D12GraphicsCommandListX *GetCmd() const { return m_cmdList; }
   ID3D12CommandAllocator *GetCmdAlloc() const { return m_cmdAlloc; }
@@ -1055,13 +1076,50 @@ public:
     SAFE_RELEASE(m_gpuFence);
     SAFE_RELEASE(m_accStructPatchInfo.m_rootSignature);
     SAFE_RELEASE(m_accStructPatchInfo.m_pipeline);
+    SAFE_RELEASE(m_RayPatchingData.descPatchRootSig);
+    SAFE_RELEASE(m_RayPatchingData.descPatchPipe);
+    SAFE_RELEASE(m_RayPatchingData.indirectComSig);
+    SAFE_RELEASE(m_RayPatchingData.indirectPrepPipe);
+    SAFE_RELEASE(m_RayPatchingData.indirectPrepRootSig);
   }
 
   void InitInternalResources();
 
+  uint32_t RegisterLocalRootSig(const D3D12RootSignature &sig);
+
+  void RegisterExportDatabase(D3D12ShaderExportDatabase *db);
+  void UnregisterExportDatabase(D3D12ShaderExportDatabase *db);
+
+  void PrepareRayDispatchBuffer(const GPUAddressRangeTracker *origAddresses);
+
+  PatchedRayDispatch PatchRayDispatch(ID3D12GraphicsCommandList4 *unwrappedCmd,
+                                      rdcarray<ResourceId> heaps,
+                                      const D3D12_DISPATCH_RAYS_DESC &desc);
+  PatchedRayDispatch PatchIndirectRayDispatch(ID3D12GraphicsCommandList *unwrappedCmd,
+                                              rdcarray<ResourceId> heaps,
+                                              ID3D12CommandSignature *pCommandSignature,
+                                              UINT MaxCommandCount, ID3D12Resource *pArgumentBuffer,
+                                              UINT64 ArgumentBufferOffset,
+                                              ID3D12Resource *pCountBuffer, UINT64 CountBufferOffset);
+
+  void AddPendingASBuilds(ID3D12Fence *fence, UINT64 waitValue,
+                          const rdcarray<std::function<bool()>> &callbacks);
+  void CheckPendingASBuilds();
+
+  void ResizeSerialisationBuffer(UINT64 size);
+
+  // buffer in UAV state for emitting AS queries to, CPU accessible/mappable
+  D3D12GpuBuffer *ASQueryBuffer = NULL;
+
+  // temp buffer for AS serialise copies
+  D3D12GpuBuffer *ASSerialiseBuffer = NULL;
+
 private:
+  void InitRayDispatchPatchingResources();
   void InitReplayBlasPatchingResources();
+
   WrappedID3D12Device *m_wrappedDevice;
+  D3D12GpuBufferAllocator &m_GPUBufferAllocator;
 
   ID3D12GraphicsCommandListX *m_cmdList;
   ID3D12CommandAllocator *m_cmdAlloc;
@@ -1070,6 +1128,42 @@ private:
   HANDLE m_gpuSyncHandle;
   UINT64 m_gpuSyncCounter;
   D3D12AccStructPatchInfo m_accStructPatchInfo;
+
+  Threading::CriticalSection m_LookupBufferLock;
+
+  D3D12GpuBuffer *m_LookupBuffer = NULL;
+  D3D12_GPU_VIRTUAL_ADDRESS m_LookupAddrs[4] = {};
+  uint32_t m_NumPatchingAddrs = 0;
+
+  // each unique set of descriptor table offsets are stored here, so any root signatures which
+  // only vary in ways that don't affect which tables are contained within them (and so don't
+  // need patching) will have a single entry in here
+  rdcarray<rdcarray<uint32_t>> m_UniqueLocalRootSigs;
+
+  // export databases that are alive
+  rdcarray<D3D12ShaderExportDatabase *> m_ExportDatabases;
+
+  // is the lookup buffer dirty and needs to be recreated with the latest data?
+  bool m_LookupBufferDirty = true;
+
+  // pipeline data for patching ray dispatches
+  struct
+  {
+    ID3D12RootSignature *descPatchRootSig = NULL;
+    ID3D12PipelineState *descPatchPipe = NULL;
+    ID3D12RootSignature *indirectPrepRootSig = NULL;
+    ID3D12PipelineState *indirectPrepPipe = NULL;
+    ID3D12CommandSignature *indirectComSig = NULL;
+  } m_RayPatchingData;
+
+  struct PendingASBuild
+  {
+    ID3D12Fence *fence;
+    UINT64 fenceValue;
+    std::function<bool()> callback;
+  };
+  Threading::CriticalSection m_PendingASBuildsLock;
+  rdcarray<PendingASBuild> m_PendingASBuilds;
 };
 
 struct D3D12ResourceManagerConfiguration
@@ -1084,17 +1178,13 @@ class D3D12ResourceManager : public ResourceManager<D3D12ResourceManagerConfigur
 {
 public:
   D3D12ResourceManager(CaptureState &state, WrappedID3D12Device *dev)
-      : ResourceManager(state), m_Device(dev)
+      : ResourceManager(state), m_Device(dev), m_GPUBufferAllocator(dev)
   {
-    m_raytracingResourceManager = new D3D12RaytracingResourceAndUtilHandler(m_Device);
-    D3D12GpuBufferAllocator::Initialize(dev);
+    m_raytracingResourceManager =
+        new D3D12RaytracingResourceAndUtilHandler(m_Device, m_GPUBufferAllocator);
   }
 
-  ~D3D12ResourceManager()
-  {
-    D3D12GpuBufferAllocator::Destroy();
-    SAFE_DELETE(m_raytracingResourceManager);
-  }
+  ~D3D12ResourceManager() { SAFE_DELETE(m_raytracingResourceManager); }
 
   template <class T>
   T *GetLiveAs(ResourceId id, bool optional = false)
@@ -1114,6 +1204,8 @@ public:
   {
     return m_raytracingResourceManager;
   }
+
+  D3D12GpuBufferAllocator &GetGPUBufferAllocator() { return m_GPUBufferAllocator; }
 
   template <typename SerialiserType>
   void SerialiseResourceStates(SerialiserType &ser, BarrierSet &barriers,
@@ -1143,4 +1235,5 @@ private:
 
   WrappedID3D12Device *m_Device;
   D3D12RaytracingResourceAndUtilHandler *m_raytracingResourceManager;
+  D3D12GpuBufferAllocator m_GPUBufferAllocator;
 };

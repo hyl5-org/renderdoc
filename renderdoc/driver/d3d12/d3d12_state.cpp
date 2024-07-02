@@ -80,19 +80,27 @@ void D3D12RenderState::ResolvePendingIndirectState(WrappedID3D12Device *device)
 
   {
     byte *data = mapPtr + indirectState.argsOffs;
-    mapPtr += comSig->sig.ByteStride;
 
     for(uint32_t argIdx = 0; argIdx < indirectState.argsToProcess; argIdx++)
     {
-      uint32_t a = argIdx % comSig->sig.arguments.size();
-      const D3D12_INDIRECT_ARGUMENT_DESC &arg = comSig->sig.arguments[a];
+      size_t execIdx = argIdx / comSig->sig.arguments.size();
+      uint32_t argWithinExecIdx = argIdx % comSig->sig.arguments.size();
+      const D3D12_INDIRECT_ARGUMENT_DESC &arg = comSig->sig.arguments[argWithinExecIdx];
 
       switch(arg.Type)
       {
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
-        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS:
+        {
+          // we know this is the final argument in the signature. Set the data pointer to the start
+          // of the next execute with the proper stride. This may be unused if we are only
+          // processing one execute's worth of arguments
+          data = mapPtr + indirectState.argsOffs + comSig->sig.ByteStride * (execIdx + 1);
+          break;
+        }
         case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
         {
           size_t argSize = sizeof(uint32_t) * arg.Constant.Num32BitValuesToSet;
@@ -208,6 +216,9 @@ void D3D12RenderState::ApplyState(WrappedID3D12Device *dev, ID3D12GraphicsComman
 
   if(pipe != ResourceId())
     cmd->SetPipelineState(GetResourceManager()->GetCurrentAs<ID3D12PipelineState>(pipe));
+
+  if(stateobj != ResourceId())
+    cmd->SetPipelineState1(GetResourceManager()->GetCurrentAs<ID3D12StateObject>(stateobj));
 
   if(type == D3D12_COMMAND_LIST_TYPE_DIRECT || type == D3D12_COMMAND_LIST_TYPE_BUNDLE)
   {
@@ -344,7 +355,7 @@ void D3D12RenderState::ApplyState(WrappedID3D12Device *dev, ID3D12GraphicsComman
   }
 }
 
-void D3D12RenderState::ApplyDescriptorHeaps(ID3D12GraphicsCommandListX *cmd) const
+void D3D12RenderState::ApplyDescriptorHeaps(ID3D12GraphicsCommandList *cmd) const
 {
   rdcarray<ID3D12DescriptorHeap *> descHeaps;
   descHeaps.resize(heaps.size());
@@ -356,7 +367,7 @@ void D3D12RenderState::ApplyDescriptorHeaps(ID3D12GraphicsCommandListX *cmd) con
     cmd->SetDescriptorHeaps((UINT)descHeaps.size(), &descHeaps[0]);
 }
 
-void D3D12RenderState::ApplyComputeRootElements(ID3D12GraphicsCommandListX *cmd) const
+void D3D12RenderState::ApplyComputeRootElements(ID3D12GraphicsCommandList *cmd) const
 {
   for(size_t i = 0; i < compute.sigelems.size(); i++)
   {
@@ -364,7 +375,7 @@ void D3D12RenderState::ApplyComputeRootElements(ID3D12GraphicsCommandListX *cmd)
     // and is probably just from stale bindings that aren't going to be used
     if(compute.sigelems[i].type != eRootTable || heaps.contains(compute.sigelems[i].id))
     {
-      compute.sigelems[i].SetToCompute(GetResourceManager(), cmd, (UINT)i);
+      compute.sigelems[i].SetToCompute(GetResourceManager(), cmd, (UINT)i, false);
     }
     else
     {
@@ -374,7 +385,7 @@ void D3D12RenderState::ApplyComputeRootElements(ID3D12GraphicsCommandListX *cmd)
   }
 }
 
-void D3D12RenderState::ApplyGraphicsRootElements(ID3D12GraphicsCommandListX *cmd) const
+void D3D12RenderState::ApplyGraphicsRootElements(ID3D12GraphicsCommandList *cmd) const
 {
   for(size_t i = 0; i < graphics.sigelems.size(); i++)
   {
@@ -382,7 +393,43 @@ void D3D12RenderState::ApplyGraphicsRootElements(ID3D12GraphicsCommandListX *cmd
     // and is probably just from stale bindings that aren't going to be used
     if(graphics.sigelems[i].type != eRootTable || heaps.contains(graphics.sigelems[i].id))
     {
-      graphics.sigelems[i].SetToGraphics(GetResourceManager(), cmd, (UINT)i);
+      graphics.sigelems[i].SetToGraphics(GetResourceManager(), cmd, (UINT)i, false);
+    }
+    else
+    {
+      RDCDEBUG("Skipping setting possibly stale graphics root table referring to heap %s",
+               ToStr(graphics.sigelems[i].id).c_str());
+    }
+  }
+}
+
+void D3D12RenderState::ApplyComputeRootElementsUnwrapped(ID3D12GraphicsCommandList *cmd) const
+{
+  for(size_t i = 0; i < compute.sigelems.size(); i++)
+  {
+    // just don't set tables that aren't in the descriptor heaps, since it's invalid and can crash
+    // and is probably just from stale bindings that aren't going to be used
+    if(compute.sigelems[i].type != eRootTable || heaps.contains(compute.sigelems[i].id))
+    {
+      compute.sigelems[i].SetToCompute(GetResourceManager(), cmd, (UINT)i, true);
+    }
+    else
+    {
+      RDCDEBUG("Skipping setting possibly stale compute root table referring to heap %s",
+               ToStr(compute.sigelems[i].id).c_str());
+    }
+  }
+}
+
+void D3D12RenderState::ApplyGraphicsRootElementsUnwrapped(ID3D12GraphicsCommandList *cmd) const
+{
+  for(size_t i = 0; i < graphics.sigelems.size(); i++)
+  {
+    // just don't set tables that aren't in the descriptor heaps, since it's invalid and can crash
+    // and is probably just from stale bindings that aren't going to be used
+    if(graphics.sigelems[i].type != eRootTable || heaps.contains(graphics.sigelems[i].id))
+    {
+      graphics.sigelems[i].SetToGraphics(GetResourceManager(), cmd, (UINT)i, true);
     }
     else
     {

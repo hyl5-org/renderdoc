@@ -58,8 +58,8 @@ public:
     m_IsSint = (compType == CompType::SInt);
     m_IsFloat = (!m_IsUint && !m_IsSint);
 
-    if(compType == CompType::Depth)
-      m_IsDepth = true;
+    m_IsDepth =
+        (m_Tex->creationFlags & TextureCategory::DepthTarget) || (compType == CompType::Depth);
 
     switch(m_Tex->format.type)
     {
@@ -310,7 +310,7 @@ public:
             }
             if(mod.directShaderWrite)
               return tr("Tex Before\n\n") + modString(mod.preMod);
-            return tr("Shader Out\n\n") + modString(mod.shaderOut);
+            return tr("Shader Out\n\n") + modString(mod.shaderOut, true);
           }
         }
 
@@ -529,6 +529,14 @@ private:
     g = qBound(0.0f, (g - m_Display.rangeMin) / rangesize, 1.0f);
     b = qBound(0.0f, (b - m_Display.rangeMin) / rangesize, 1.0f);
 
+    int numComps = (int)(m_Tex->format.compCount);
+    if(numComps < 3)
+    {
+      b = 0.0f;
+      if(numComps < 2)
+        g = 0.0f;
+    }
+
     if(m_IsDepth)
       r = g = b = qBound(0.0f, (val.depth - m_Display.rangeMin) / rangesize, 1.0f);
 
@@ -537,7 +545,7 @@ private:
                                   (int)(255.0f * b + 0.5f)));
   }
 
-  QString modString(const ModificationValue &val) const
+  QString modString(const ModificationValue &val, bool forceShowAlpha = false) const
   {
     QString s;
 
@@ -564,6 +572,21 @@ private:
       {
         for(int i = 0; i < numComps; i++)
           s += colourLetterPrefix[i] + Formatter::Format(val.col.floatValue[i]) + lit("\n");
+      }
+      if(forceShowAlpha && numComps < 4)
+      {
+        if(m_IsUint)
+        {
+          s += colourLetterPrefix[3] + Formatter::Format(val.col.uintValue[3]) + lit("\n");
+        }
+        else if(m_IsSint)
+        {
+          s += colourLetterPrefix[3] + Formatter::Format(val.col.intValue[3]) + lit("\n");
+        }
+        else
+        {
+          s += colourLetterPrefix[3] + Formatter::Format(val.col.floatValue[3]) + lit("\n");
+        }
       }
     }
 
@@ -799,12 +822,10 @@ void PixelHistoryView::startDebug(EventTag tag)
     return;
   }
 
-  const ShaderBindpointMapping &bindMapping =
-      m_Ctx.CurPipelineState().GetBindpointMapping(ShaderStage::Pixel);
   ResourceId pipeline = m_Ctx.CurPipelineState().GetGraphicsPipelineObject();
 
   // viewer takes ownership of the trace
-  IShaderViewer *s = m_Ctx.DebugShader(&bindMapping, shaderDetails, pipeline, trace, debugContext);
+  IShaderViewer *s = m_Ctx.DebugShader(shaderDetails, pipeline, trace, debugContext);
 
   m_Ctx.AddDockWindow(s->Widget(), DockReference::MainToolArea, NULL);
 }

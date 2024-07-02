@@ -307,6 +307,23 @@ bool WrappedVulkan::Serialise_vkAllocateMemory(SerialiserType &ser, VkDevice dev
 
     UnwrapNextChain(m_State, "VkMemoryAllocateInfo", tempMem, (VkBaseInStructure *)&patched);
 
+    // remove dedicated memory struct if it is not allowed due to changing memory sizes
+    {
+      VkMemoryDedicatedAllocateInfo *dedicated = (VkMemoryDedicatedAllocateInfo *)FindNextStruct(
+          &AllocateInfo, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+      if(dedicated && dedicated->image != VK_NULL_HANDLE)
+      {
+        VkMemoryRequirements mrq = {};
+        ObjDisp(device)->GetImageMemoryRequirements(Unwrap(device), Unwrap(dedicated->image), &mrq);
+
+        if(mrq.size != AllocateInfo.allocationSize)
+        {
+          RDCDEBUG("Removing dedicated allocation for incompatible size");
+          RemoveNextStruct(&patched, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+        }
+      }
+    }
+
     if(patched.memoryTypeIndex >= m_PhysicalDeviceData.memProps.memoryTypeCount)
     {
       SET_ERROR_RESULT(
@@ -495,6 +512,19 @@ VkResult WrappedVulkan::vkAllocateMemory(VkDevice device, const VkMemoryAllocate
   // when whitelisting the extension and creating the device.
   if(IsCaptureMode(m_State) && memFlags && (memFlags->flags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT))
     memFlags->flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+
+  // remove dedicated memory struct if it is not allowed
+  {
+    VkMemoryDedicatedAllocateInfo *dedicated = (VkMemoryDedicatedAllocateInfo *)FindNextStruct(
+        pAllocateInfo, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+    if(dedicated && dedicated->image != VK_NULL_HANDLE)
+    {
+      VkResourceRecord *imageRecord = GetRecord(dedicated->image);
+
+      if(imageRecord->resInfo->banDedicated)
+        RemoveNextStruct(&unwrapped, VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+    }
+  }
 
   VkResult ret;
   SERIALISE_TIME_CALL(
@@ -1471,7 +1501,7 @@ VkResult WrappedVulkan::vkBindBufferMemory(VkDevice device, VkBuffer buffer, VkD
     VkResourceRecord *memrecord = GetRecord(memory);
 
     record->AddParent(memrecord);
-    record->baseResource = id;
+    record->baseResourceMem = record->baseResource = id;
     record->dedicated = memrecord->memMapState->dedicated;
     record->memOffset = memoryOffset;
 
@@ -1561,8 +1591,6 @@ bool WrappedVulkan::Serialise_vkBindImageMemory(SerialiserType &ser, VkDevice de
 VkResult WrappedVulkan::vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory mem,
                                           VkDeviceSize memOffset)
 {
-  VkResourceRecord *record = GetRecord(image);
-
   VkResult ret;
   SERIALISE_TIME_CALL(ret = ObjDisp(device)->BindImageMemory(Unwrap(device), Unwrap(image),
                                                              Unwrap(mem), memOffset));
@@ -1590,6 +1618,39 @@ VkResult WrappedVulkan::vkBindImageMemory(VkDevice device, VkImage image, VkDevi
         state->isMemoryBound = true;
     }
 
+    VkResourceRecord *record = GetRecord(image);
+
+    if(record->resInfo->imageInfo.isAHB)
+    {
+      VkMemoryRequirements nonExternalMrq = record->resInfo->memreqs;
+      ObjDisp(device)->GetImageMemoryRequirements(Unwrap(device), Unwrap(image),
+                                                  &record->resInfo->memreqs);
+
+      VkMemoryRequirements &externalMrq = record->resInfo->memreqs;
+
+      RDCDEBUG(
+          "AHB-backed external image requires %llu bytes at %llu alignment, in %x memory types",
+          externalMrq.size, externalMrq.alignment, externalMrq.memoryTypeBits);
+      RDCDEBUG(
+          "Non-external version requires %llu bytes at %llu alignment, in %x memory "
+          "types",
+          nonExternalMrq.size, nonExternalMrq.alignment, nonExternalMrq.memoryTypeBits);
+
+      externalMrq.size = RDCMAX(externalMrq.size, nonExternalMrq.size);
+      externalMrq.alignment = RDCMAX(externalMrq.alignment, nonExternalMrq.alignment);
+
+      if((externalMrq.memoryTypeBits & nonExternalMrq.memoryTypeBits) == 0)
+      {
+        RDCWARN(
+            "External image shares no memory types with non-external image. This image "
+            "will not be replayable.");
+      }
+      else
+      {
+        externalMrq.memoryTypeBits &= nonExternalMrq.memoryTypeBits;
+      }
+    }
+
     // memory object bindings are immutable and must happen before creation or use,
     // so this can always go into the record, even if a resource is created and bound
     // to memory mid-frame
@@ -1602,7 +1663,7 @@ VkResult WrappedVulkan::vkBindImageMemory(VkDevice device, VkImage image, VkDevi
     // images are a base resource but we want to track where their memory comes from.
     // Anything that looks up a baseResource for an image knows not to chase further
     // than the image.
-    record->baseResource = memrecord->GetResourceID();
+    record->baseResourceMem = record->baseResource = memrecord->GetResourceID();
     record->dedicated = memrecord->memMapState->dedicated;
   }
   else
@@ -1719,10 +1780,17 @@ VkResult WrappedVulkan::vkCreateBuffer(VkDevice device, const VkBufferCreateInfo
   // effectively free as a usage bit for all sensible implementations so we just add it here.
   adjusted_info.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-  // If we're using this buffer for device addresses, ensure we force on capture replay bit.
-  // We ensured the physical device can support this feature before whitelisting the extension.
-  if(IsCaptureMode(m_State) && (adjusted_info.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT))
-    adjusted_info.flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+  if(IsCaptureMode(m_State))
+  {
+    // If we're using this buffer for AS storage we need to enable BDA
+    if(adjusted_info.usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR)
+      adjusted_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+    // If we're using this buffer for device addresses, ensure we force on capture replay bit.
+    // We ensured the physical device can support this feature before whitelisting the extension.
+    if(adjusted_info.usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+      adjusted_info.flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+  }
 
   byte *tempMem = GetTempMemory(GetNextPatchSize(adjusted_info.pNext));
 
@@ -2008,7 +2076,7 @@ VkResult WrappedVulkan::vkCreateBufferView(VkDevice device, const VkBufferViewCr
 
       // store the base resource
       record->baseResource = bufferRecord->GetResourceID();
-      record->baseResourceMem = bufferRecord->baseResource;
+      record->baseResourceMem = bufferRecord->baseResourceMem;
       record->dedicated = bufferRecord->dedicated;
       record->resInfo = bufferRecord->resInfo;
       record->storable = bufferRecord->storable;
@@ -2135,7 +2203,7 @@ bool WrappedVulkan::Serialise_vkCreateImage(SerialiserType &ser, VkDevice device
 
       if(formatListInfo)
       {
-        uint32_t bs = GetByteSize(1, 1, 1, CreateInfo.format, 0);
+        uint32_t bs = (uint32_t)GetByteSize(1, 1, 1, CreateInfo.format, 0);
 
         VkFormat msaaCopyFormat = VK_FORMAT_UNDEFINED;
         if(bs == 1)
@@ -2267,6 +2335,13 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
 {
   VkImageCreateInfo createInfo_adjusted = *pCreateInfo;
 
+  // We can't process this call if it carries an unknown format
+  if(pCreateInfo->format == VK_FORMAT_UNDEFINED)
+  {
+    RDCERR("Image format undefined");
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+  }
+
   // if you change any properties here, ensure you also update
   // vkGetDeviceImageMemoryRequirementsKHR
 
@@ -2355,7 +2430,7 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
 
     if(formatListInfo)
     {
-      uint32_t bs = GetByteSize(1, 1, 1, createInfo_adjusted.format, 0);
+      uint32_t bs = (uint32_t)GetByteSize(1, 1, 1, createInfo_adjusted.format, 0);
 
       VkFormat msaaCopyFormat = VK_FORMAT_UNDEFINED;
       if(bs == 1)
@@ -2423,9 +2498,6 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
 
       record->storable = (pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
 
-      // pre-populate memory requirements
-      ObjDisp(device)->GetImageMemoryRequirements(Unwrap(device), Unwrap(*pImage), &resInfo.memreqs);
-
       bool isLinear = (pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR);
 
       bool isExternal = false;
@@ -2440,7 +2512,16 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
            next->sType == VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID)
         {
           isExternal = true;
-          break;
+
+          // we can't call vkGetImageMemoryRequirements on AHB-backed images until they are bound
+          if(next->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
+          {
+            VkExternalMemoryImageCreateInfo *extCreateInfo = (VkExternalMemoryImageCreateInfo *)next;
+            resInfo.imageInfo.isAHB =
+                (extCreateInfo->handleTypes &
+                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID) != 0;
+            break;
+          }
         }
 
         next = next->pNext;
@@ -2453,6 +2534,11 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
       // appropriate.
       GetResourceManager()->MarkDirtyResource(id);
       GetResourceManager()->MarkResourceFrameReferenced(id, eFrameRef_ReadBeforeWrite);
+
+      // pre-populate memory requirements
+      if(!resInfo.imageInfo.isAHB)
+        ObjDisp(device)->GetImageMemoryRequirements(Unwrap(device), Unwrap(*pImage),
+                                                    &resInfo.memreqs);
 
       // sparse and external images should be considered dirty from creation anyway. For sparse
       // images this is so that we can serialise the tracked page table, for external images this is
@@ -2491,27 +2577,53 @@ VkResult WrappedVulkan::vkCreateImage(VkDevice device, const VkImageCreateInfo *
             VkMemoryRequirements mrq = {};
             ObjDisp(device)->GetImageMemoryRequirements(Unwrap(device), tmpimg, &mrq);
 
-            if(mrq.size > 0)
+            // If this is an AHB-backed image its memory requirements will need retrieving after
+            // binding.  So just store the non-external data for reference
+            // (see WrappedVulkan::vkBindImageMemory)
+            if(resInfo.imageInfo.isAHB)
             {
-              RDCDEBUG("External image requires %llu bytes at %llu alignment, in %x memory types",
-                       resInfo.memreqs.size, resInfo.memreqs.alignment,
-                       resInfo.memreqs.memoryTypeBits);
-              RDCDEBUG(
-                  "Non-external version requires %llu bytes at %llu alignment, in %x memory types",
-                  mrq.size, mrq.alignment, mrq.memoryTypeBits);
+              resInfo.memreqs.size = mrq.size;
+              resInfo.memreqs.alignment = mrq.alignment;
+              resInfo.memreqs.memoryTypeBits = mrq.memoryTypeBits;
 
-              resInfo.memreqs.size = RDCMAX(resInfo.memreqs.size, mrq.size);
-              resInfo.memreqs.alignment = RDCMAX(resInfo.memreqs.alignment, mrq.alignment);
+              RDCWARN(
+                  "Android hardware buffer backed image, so pre-emptively banning dedicated "
+                  "memory");
+              resInfo.banDedicated = true;
+            }
+            else
+            {
+              if(mrq.size > 0)
+              {
+                RDCDEBUG("External image requires %llu bytes at %llu alignment, in %x memory types",
+                         resInfo.memreqs.size, resInfo.memreqs.alignment,
+                         resInfo.memreqs.memoryTypeBits);
+                RDCDEBUG(
+                    "Non-external version requires %llu bytes at %llu alignment, in %x memory "
+                    "types",
+                    mrq.size, mrq.alignment, mrq.memoryTypeBits);
 
-              if((resInfo.memreqs.memoryTypeBits & mrq.memoryTypeBits) == 0)
-              {
-                RDCWARN(
-                    "External image shares no memory types with non-external image. This image "
-                    "will not be replayable.");
-              }
-              else
-              {
-                resInfo.memreqs.memoryTypeBits &= mrq.memoryTypeBits;
+                if(resInfo.memreqs.size != mrq.size)
+                {
+                  RDCWARN(
+                      "Required size changed on image between external/non-external, banning "
+                      "dedicated memory");
+                  resInfo.banDedicated = true;
+                }
+
+                resInfo.memreqs.size = RDCMAX(resInfo.memreqs.size, mrq.size);
+                resInfo.memreqs.alignment = RDCMAX(resInfo.memreqs.alignment, mrq.alignment);
+
+                if((resInfo.memreqs.memoryTypeBits & mrq.memoryTypeBits) == 0)
+                {
+                  RDCWARN(
+                      "External image shares no memory types with non-external image. This image "
+                      "will not be replayable.");
+                }
+                else
+                {
+                  resInfo.memreqs.memoryTypeBits &= mrq.memoryTypeBits;
+                }
               }
             }
           }
@@ -2756,7 +2868,7 @@ VkResult WrappedVulkan::vkCreateImageView(VkDevice device, const VkImageViewCrea
       // store the base resource. Note images have a baseResource pointing
       // to their memory, which we will also need so we store that separately
       record->baseResource = imageRecord->GetResourceID();
-      record->baseResourceMem = imageRecord->baseResource;
+      record->baseResourceMem = imageRecord->baseResourceMem;
       record->dedicated = imageRecord->dedicated;
       record->resInfo = imageRecord->resInfo;
       record->viewRange = pCreateInfo->subresourceRange;
@@ -2891,7 +3003,7 @@ VkResult WrappedVulkan::vkBindBufferMemory2(VkDevice device, uint32_t bindInfoCo
       bufrecord->AddChunk(chunk);
 
       bufrecord->AddParent(memrecord);
-      bufrecord->baseResource = memrecord->GetResourceID();
+      bufrecord->baseResourceMem = bufrecord->baseResource = memrecord->GetResourceID();
       bufrecord->dedicated = memrecord->memMapState->dedicated;
       bufrecord->memOffset = pBindInfos[i].memoryOffset;
 
@@ -3024,6 +3136,37 @@ VkResult WrappedVulkan::vkBindImageMemory2(VkDevice device, uint32_t bindInfoCou
           state->isMemoryBound = true;
       }
 
+      if(imgrecord->resInfo->imageInfo.isAHB)
+      {
+        VkMemoryRequirements nonExternalMrq = imgrecord->resInfo->memreqs;
+        ObjDisp(device)->GetImageMemoryRequirements(Unwrap(device), Unwrap(pBindInfos[i].image),
+                                                    &imgrecord->resInfo->memreqs);
+
+        VkMemoryRequirements &externalMrq = imgrecord->resInfo->memreqs;
+
+        RDCDEBUG(
+            "AHB-backed external image requires %llu bytes at %llu alignment, in %x memory types",
+            externalMrq.size, externalMrq.alignment, externalMrq.memoryTypeBits);
+        RDCDEBUG(
+            "Non-external version requires %llu bytes at %llu alignment, in %x memory "
+            "types",
+            nonExternalMrq.size, nonExternalMrq.alignment, nonExternalMrq.memoryTypeBits);
+
+        externalMrq.size = RDCMAX(externalMrq.size, nonExternalMrq.size);
+        externalMrq.alignment = RDCMAX(externalMrq.alignment, nonExternalMrq.alignment);
+
+        if((externalMrq.memoryTypeBits & nonExternalMrq.memoryTypeBits) == 0)
+        {
+          RDCWARN(
+              "External image shares no memory types with non-external image. This image "
+              "will not be replayable.");
+        }
+        else
+        {
+          externalMrq.memoryTypeBits &= nonExternalMrq.memoryTypeBits;
+        }
+      }
+
       // memory object bindings are immutable and must happen before creation or use,
       // so this can always go into the record, even if a resource is created and bound
       // to memory mid-frame
@@ -3034,7 +3177,7 @@ VkResult WrappedVulkan::vkBindImageMemory2(VkDevice device, uint32_t bindInfoCou
       // images are a base resource but we want to track where their memory comes from.
       // Anything that looks up a baseResource for an image knows not to chase further
       // than the image.
-      imgrecord->baseResource = memrecord->GetResourceID();
+      imgrecord->baseResourceMem = imgrecord->baseResource = memrecord->GetResourceID();
       imgrecord->dedicated = memrecord->memMapState->dedicated;
     }
   }
@@ -3139,7 +3282,7 @@ bool WrappedVulkan::Serialise_vkCreateAccelerationStructureKHR(
 
     VkAccelerationStructureKHR acc = VK_NULL_HANDLE;
     VkResult ret =
-        ObjDisp(device)->CreateAccelerationStructureKHR(Unwrap(device), &CreateInfo, NULL, &acc);
+        ObjDisp(device)->CreateAccelerationStructureKHR(Unwrap(device), &unwrappedInfo, NULL, &acc);
 
     if(ret != VK_SUCCESS)
     {
@@ -3186,6 +3329,13 @@ VkResult WrappedVulkan::vkCreateAccelerationStructureKHR(
     const VkAllocationCallbacks *, VkAccelerationStructureKHR *pAccelerationStructure)
 {
   VkAccelerationStructureCreateInfoKHR unwrappedInfo = *pCreateInfo;
+
+  // Ensure we force on capture replay bit. We ensured the physical device can support this feature
+  // before whitelisting the extension.
+  if(IsCaptureMode(m_State))
+    unwrappedInfo.createFlags |=
+        VK_ACCELERATION_STRUCTURE_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT_KHR;
+
   unwrappedInfo.buffer = Unwrap(unwrappedInfo.buffer);
   VkResult ret;
   SERIALISE_TIME_CALL(ret = ObjDisp(device)->CreateAccelerationStructureKHR(
@@ -3197,13 +3347,27 @@ VkResult WrappedVulkan::vkCreateAccelerationStructureKHR(
 
     if(IsCaptureMode(m_State))
     {
+      // We're capturing, so get the device address of the created AS
+      VkAccelerationStructureCreateInfoKHR serialisedCreateInfo = *pCreateInfo;
+      serialisedCreateInfo.createFlags |=
+          VK_ACCELERATION_STRUCTURE_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT_KHR;
+
+      const VkAccelerationStructureDeviceAddressInfoKHR getInfo = {
+          VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+          NULL,
+          Unwrap(*pAccelerationStructure),
+      };
+      const VkDeviceAddress addr =
+          ObjDisp(device)->GetAccelerationStructureDeviceAddressKHR(Unwrap(device), &getInfo);
+      serialisedCreateInfo.deviceAddress = addr;
+
       Chunk *chunk = NULL;
 
       {
         CACHE_THREAD_SERIALISER();
 
         SCOPED_SERIALISE_CHUNK(VulkanChunk::vkCreateAccelerationStructureKHR);
-        Serialise_vkCreateAccelerationStructureKHR(ser, device, pCreateInfo, NULL,
+        Serialise_vkCreateAccelerationStructureKHR(ser, device, &serialisedCreateInfo, NULL,
                                                    pAccelerationStructure);
 
         chunk = scope.Get();
@@ -3223,6 +3387,16 @@ VkResult WrappedVulkan::vkCreateAccelerationStructureKHR(
       record->storable = bufferRecord->storable;
       record->memOffset = bufferRecord->memOffset + pCreateInfo->offset;
       record->memSize = pCreateInfo->size;
+
+      GetResourceManager()->MarkDirtyResource(id);
+      if(pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
+         pCreateInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR)
+      {
+        // We force reference BLASs as it is not feasible to track at the API level which TLASs
+        // reference them.  We force ref generics too as they could bottom or top level so we
+        // conservatively assume they are bottom
+        AddForcedReference(record);
+      }
     }
     else
     {

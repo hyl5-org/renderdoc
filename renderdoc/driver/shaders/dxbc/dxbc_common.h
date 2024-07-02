@@ -29,6 +29,13 @@
 #include "api/replay/rdcpair.h"
 #include "api/replay/rdcstr.h"
 #include "api/replay/shader_types.h"
+#include "dxbcdxil_debug.h"
+
+struct DXBCContainerDebugger : public ShaderDebugger
+{
+  DXBCContainerDebugger(bool dxil) : isDXIL(dxil){};
+  const bool isDXIL;
+};
 
 namespace DXBCBytecode
 {
@@ -75,6 +82,8 @@ enum class ShaderType
   // Max value
   Max,
 };
+
+ShaderStage GetShaderStage(ShaderType type);
 
 /////////////////////////////////////////////////////////////////////////
 // the below classes basically mimics the existing reflection interface.
@@ -247,6 +256,9 @@ struct ShaderInputBind
     TYPE_UAV_APPEND_STRUCTURED,
     TYPE_UAV_CONSUME_STRUCTURED,
     TYPE_UAV_RWSTRUCTURED_WITH_COUNTER,
+
+    // these entries below do not exist in dxbc and so are only set by RenderDoc manually
+    TYPE_RTAS,
   } type;
 
   constexpr bool IsCBuffer() const { return type == TYPE_CBUFFER; }
@@ -254,7 +266,7 @@ struct ShaderInputBind
   constexpr bool IsSRV() const
   {
     return type == TYPE_TBUFFER || type == TYPE_TEXTURE || type == TYPE_STRUCTURED ||
-           type == TYPE_BYTEADDRESS;
+           type == TYPE_BYTEADDRESS || type == TYPE_RTAS;
   }
   constexpr bool IsUAV() const
   {
@@ -283,6 +295,9 @@ struct ShaderInputBind
     DIM_TEXTURECUBE,
     DIM_TEXTURECUBEARRAY,
     DIM_BUFFEREX,
+
+    // these entries below do not exist in dxbc and so are only set by RenderDoc manually
+    DIM_RTAS,
   } dimension;
 
   uint32_t numComps;
@@ -352,6 +367,7 @@ struct CBuffer
   } descriptor;
 
   rdcarray<CBufferVariable> variables;
+  bool hasReflectionData;
 };
 
 struct Reflection
@@ -398,4 +414,7 @@ public:
   virtual void GetLocals(const DXBC::DXBCContainer *dxbc, size_t instruction, uintptr_t offset,
                          rdcarray<SourceVariableMapping> &locals) const = 0;
 };
+
+rdcstr BasicDemangle(const rdcstr &possiblyMangledName);
+
 };

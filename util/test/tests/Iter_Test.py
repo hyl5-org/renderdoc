@@ -39,12 +39,12 @@ class Iter_Test(rdtest.TestCase):
         texsave = rd.TextureSave()
 
         for res in pipe.GetOutputTargets():
-            texsave.resourceId = res.resourceId
+            texsave.resourceId = res.resource
             texsave.mip = res.firstMip
             self.save_texture(texsave)
 
         depth = pipe.GetDepthTarget()
-        texsave.resourceId = depth.resourceId
+        texsave.resourceId = depth.resource
         texsave.mip = depth.firstMip
         self.save_texture(texsave)
 
@@ -122,15 +122,17 @@ class Iter_Test(rdtest.TestCase):
                 name = var.name
 
                 if name not in postvs[0].keys():
-                    raise rdtest.TestFailureException("Don't have expected output for {}".format(name))
+                    rdtest.log.error("Don't have expected output for {}".format(name))
+                    continue
 
                 expect = postvs[0][name]
                 value = self.evaluate_source_var(var, variables)
 
                 if len(expect) != value.columns:
-                    raise rdtest.TestFailureException(
+                    rdtest.log.error(
                         "Output {} at EID {} has different size ({} values) to expectation ({} values)"
                             .format(name, action.eventId, value.columns, len(expect)))
+                    continue
 
                 compType = rd.VarTypeCompType(value.type)
                 if compType == rd.CompType.UInt:
@@ -169,7 +171,7 @@ class Iter_Test(rdtest.TestCase):
             rdtest.log.print("No pixel shader bound at {}".format(action.eventId))
             return
 
-        if len(pipe.GetOutputTargets()) == 0 and pipe.GetDepthTarget().resourceId == rd.ResourceId.Null():
+        if len(pipe.GetOutputTargets()) == 0 and pipe.GetDepthTarget().resource == rd.ResourceId.Null():
             rdtest.log.print("No render targets bound at {}".format(action.eventId))
             return
 
@@ -188,13 +190,13 @@ class Iter_Test(rdtest.TestCase):
         target = rd.ResourceId.Null()
 
         if len(pipe.GetOutputTargets()) > 0:
-            valid_targets = [o.resourceId for o in pipe.GetOutputTargets() if o.resourceId != rd.ResourceId.Null()]
+            valid_targets = [o.resource for o in pipe.GetOutputTargets() if o.resource != rd.ResourceId.Null()]
             rdtest.log.print("Valid targets at {} are {}".format(action.eventId, valid_targets))
             if len(valid_targets) > 0:
                 target = valid_targets[int(random.random()*len(valid_targets))]
 
         if target == rd.ResourceId.Null():
-            target = pipe.GetDepthTarget().resourceId
+            target = pipe.GetDepthTarget().resource
 
         if target == rd.ResourceId.Null():
             rdtest.log.print("No targets bound! Can't fetch history at {}".format(action.eventId))
@@ -233,7 +235,7 @@ class Iter_Test(rdtest.TestCase):
 
             break
 
-        if target == pipe.GetDepthTarget().resourceId:
+        if target == pipe.GetDepthTarget().resource:
             rdtest.log.print("Not doing pixel debug for depth output")
             return
 
@@ -256,7 +258,7 @@ class Iter_Test(rdtest.TestCase):
 
             cycles, variables = self.process_trace(trace)
 
-            output_index = [o.resourceId for o in pipe.GetOutputTargets()].index(target)
+            output_index = [o.resource for o in pipe.GetOutputTargets()].index(target)
 
             if action.outputs[0] == rd.ResourceId.Null():
                 rdtest.log.success('Successfully debugged pixel in {} cycles, skipping result check due to no output'.format(cycles))
@@ -310,7 +312,7 @@ class Iter_Test(rdtest.TestCase):
     def drawcall_overlay(self, action: rd.ActionDescription):
         pipe = self.controller.GetPipelineState()
 
-        if len(pipe.GetOutputTargets()) == 0 and pipe.GetDepthTarget().resourceId == rd.ResourceId.Null():
+        if len(pipe.GetOutputTargets()) == 0 and pipe.GetDepthTarget().resource == rd.ResourceId.Null():
             rdtest.log.print("No render targets bound at {}".format(action.eventId))
             return
 
@@ -326,8 +328,8 @@ class Iter_Test(rdtest.TestCase):
         depth = pipe.GetDepthTarget()
         if len(col) > 1 and col[0].resourceId != rd.ResourceId():
             tex.resourceId = col[0].resourceId
-        elif depth.resourceId != rd.ResourceId():
-            tex.resourceId = depth.resourceId
+        elif depth.resource != rd.ResourceId():
+            tex.resourceId = depth.resource
 
         if tex.resourceId != rd.ResourceId():
             self.texout.SetTextureDisplay(tex)

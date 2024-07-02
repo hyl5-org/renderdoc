@@ -27,6 +27,7 @@
 
 #include <map>
 #include "api/replay/rdcarray.h"
+#include "api/replay/rdcflatmap.h"
 #include "api/replay/rdcpair.h"
 #include "api/replay/rdcstr.h"
 #include "common/common.h"
@@ -160,6 +161,7 @@ struct RDEFHeader;
 uint32_t DecodeFlags(const ShaderCompileFlags &compileFlags);
 rdcstr GetProfile(const ShaderCompileFlags &compileFlags);
 ShaderCompileFlags EncodeFlags(const uint32_t flags, const rdcstr &profile);
+void EncodeDXCFlags(uint32_t flags, rdcarray<rdcwstr> &args);
 
 // declare one of these and pass in your shader bytecode, then inspect
 // the members that are populated with the shader information.
@@ -184,7 +186,22 @@ public:
   const Reflection *GetReflection() const { return m_Reflection; }
   D3D_PRIMITIVE_TOPOLOGY GetOutputTopology();
 
-  const rdcstr &GetDisassembly();
+  CBufferVariableType GetRayPayload(const ShaderEntryPoint &entry)
+  {
+    if(m_RayPayloads.empty())
+      return {};
+    return m_RayPayloads[entry].first;
+  }
+  CBufferVariableType GetRayAttributes(const ShaderEntryPoint &entry)
+  {
+    if(m_RayPayloads.empty())
+      return {};
+    return m_RayPayloads[entry].second;
+  }
+
+  rdcarray<ShaderEntryPoint> GetEntryPoints() const { return m_EntryPoints; }
+
+  const rdcstr &GetDisassembly(bool dxcStyle);
   void FillTraceLineInfo(ShaderDebugTrace &trace) const;
 
   static void StripChunk(bytebuf &ByteCode, uint32_t fourcc);
@@ -217,6 +234,7 @@ public:
 
   static bool CheckForDebugInfo(const void *ByteCode, size_t ByteCodeLength);
   static bool CheckForDXIL(const void *ByteCode, size_t ByteCodeLength);
+  static bool CheckForRootSig(const void *ByteCode, size_t ByteCodeLength);
   static rdcstr GetDebugBinaryPath(const void *ByteCode, size_t ByteCodeLength);
   static D3D_PRIMITIVE_TOPOLOGY GetOutputTopology(const void *ByteCode, size_t ByteCodeLength);
 
@@ -227,6 +245,7 @@ private:
   bytebuf m_ShaderBlob;
 
   rdcstr m_Disassembly;
+  bool m_DXCStyle = false;
 
   D3D_PRIMITIVE_TOPOLOGY m_OutputTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
 
@@ -243,11 +262,14 @@ private:
   size_t m_NonDebugDXILByteCodeOffset = 0;
   size_t m_NonDebugDXILByteCodeSize = 0;
 
+  rdcflatmap<ShaderEntryPoint, rdcpair<CBufferVariableType, CBufferVariableType>> m_RayPayloads;
+
   ShaderStatistics m_ShaderStats;
   DXBCBytecode::Program *m_DXBCByteCode = NULL;
   DXIL::Program *m_DXILByteCode = NULL;
   IDebugInfo *m_DebugInfo = NULL;
   Reflection *m_Reflection = NULL;
+  rdcarray<ShaderEntryPoint> m_EntryPoints;
 };
 
 };    // namespace DXBC

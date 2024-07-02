@@ -35,6 +35,7 @@
 #include <QSharedPointer>
 #include <QSortFilterProxyModel>
 #include <QStyledItemDelegate>
+#include <QToolButton>
 #include "Code/Interface/QRDInterface.h"
 
 #if !defined(RELEASE) && !defined(__FreeBSD__)
@@ -106,6 +107,9 @@ struct Rules
   Rules() = default;
   Rules(APIConfig config)
   {
+    // no packing allows this by default, it is only enabled manually
+    tight_bitfield_packing = false;
+
     // default to the most conservative packing ruleset
 
     switch(config)
@@ -179,6 +183,10 @@ struct Rules
   // trailing padding and members after a struct are not packed in that padding). For arrays it does
   // not apply since C arrays are packed.
   bool trailing_overlap = false;
+
+  // whether bitfields will allow themselves to straddle their base type, or be aligned to stay
+  // within it. Equivalent to #pragma pack(1) in C++
+  bool tight_bitfield_packing = false;
 };
 
 };    // namespace Packing
@@ -765,6 +773,47 @@ private:
   QAbstractItemView *m_widget;
 };
 
+class ButtonDelegate : public QStyledItemDelegate
+{
+private:
+  Q_OBJECT
+
+  QModelIndex m_ClickedIndex;
+  QIcon m_Icon;
+  QString m_Text;
+  bool m_Centered = true;
+
+  int m_EnableRole = -1;
+  QVariant m_EnableValue;
+
+  int m_VisibleRole = -1;
+  QVariant m_VisibleValue;
+
+  QRect getButtonRect(const QRect boundsRect, const QSize sz) const;
+
+public:
+  ButtonDelegate(const QIcon &icon, QString text, QWidget *parent);
+  void paint(QPainter *painter, const QStyleOptionViewItem &option,
+             const QModelIndex &index) const override;
+  QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override;
+  bool editorEvent(QEvent *event, QAbstractItemModel *model, const QStyleOptionViewItem &option,
+                   const QModelIndex &index) override;
+
+  void setVisibleTrigger(int role, QVariant value)
+  {
+    m_VisibleRole = role;
+    m_VisibleValue = value;
+  }
+  void setEnableTrigger(int role, QVariant value)
+  {
+    m_EnableRole = role;
+    m_EnableValue = value;
+  }
+  void setCentred(bool centered) { m_Centered = centered; }
+signals:
+  void messageClicked(const QModelIndex &index);
+};
+
 class StructuredDataItemModel : public QAbstractItemModel
 {
 public:
@@ -988,3 +1037,20 @@ void *AccessWaylandPlatformInterface(const QByteArray &resource, QWindow *window
 
 void UpdateVisibleColumns(rdcstr windowTitle, int columnCount, QHeaderView *header,
                           const QStringList &headers);
+
+// A version of QToolButton that can also handle right clicks
+class QRClickToolButton : public QToolButton
+{
+  Q_OBJECT
+
+public:
+  explicit QRClickToolButton(QWidget *parent = 0);
+
+private slots:
+  void mousePressEvent(QMouseEvent *e);
+
+signals:
+  void rightClicked();
+
+public slots:
+};

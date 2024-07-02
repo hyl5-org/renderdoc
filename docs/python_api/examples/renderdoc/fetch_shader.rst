@@ -33,17 +33,17 @@ For the purposes of this example we use the API abstraction :py:class:`~renderdo
 	# Get the pixel shader's reflection object
 	ps = state.GetShaderReflection(rd.ShaderStage.Pixel)
 
-	cb = state.GetConstantBuffer(rd.ShaderStage.Pixel, 0, 0)
+	cb = state.GetConstantBlock(rd.ShaderStage.Pixel, 0, 0)
 
     print("Pixel shader:")
     print(controller.DisassembleShader(pipe, ps.reflection, target))
 
-Now we want to display the constants bound to this shader. Shader bindings is an area that diverges quite a lot between the APIs, and RenderDoc's abstraction over this is detailed in :py:class:`~renderdoc.BindPointMap`. For now, we'll simply select the first constant buffer in this shader and fetch the constants for it with :py:meth:`~renderdoc.ReplayController.GetCBufferVariableContents`.
+Now we want to display the constants bound to this shader. Shader bindings is an area that diverges quite a lot between the APIs, and RenderDoc's abstraction over this is detailed in :ref:`more detail <descriptor-abstraction>`. For now, we'll simply select the first constant buffer in this shader and fetch the constants for it with :py:meth:`~renderdoc.ReplayController.GetCBufferVariableContents`.
 
 .. highlight:: python
 .. code:: python
 
-    cbufferVars = controller.GetCBufferVariableContents(pipe, ps.resourceId, rd.ShaderStage.Pixel, entry, 0, cb.resourceId, 0, 0)
+    cbufferVars = controller.GetCBufferVariableContents(pipe, ps.resourceId, rd.ShaderStage.Pixel, entry, 0, cb.descriptor.resource, 0, 0)
 
 Since constants can contain structs of other constants, we want to define a recursive function that will iterate over a constant and print it along with its value. We want to handle both vectors and matrices so we need to iterate over both rows and columns for each variable.
 

@@ -77,9 +77,6 @@ inline uint64_t CountOnes(uint64_t value)
 
 namespace rdcspv
 {
-const BindpointIndex DebugAPIWrapper::invalidBind = BindpointIndex(-12345, -12345, ~0U);
-const BindpointIndex DebugAPIWrapper::pointerBind = BindpointIndex(-12345, -67890, ~0U);
-
 ThreadState::ThreadState(uint32_t workgroupIdx, Debugger &debug, const GlobalState &globalState)
     : debugger(debug), global(globalState)
 {
@@ -590,7 +587,7 @@ void ThreadState::SkipIgnoredInstructions()
       continue;
     }
 
-    if(op == Op::ExtInst)
+    if(op == Op::ExtInst || op == Op::ExtInstWithForwardRefsKHR)
     {
       if(debugger.IsDebugExtInstSet(Id::fromWord(it.word(3))))
       {
@@ -749,7 +746,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
       ShaderVariable result;
       result.rows = result.columns = 1;
 
-      BindpointIndex bind = debugger.GetPointerValue(structPointer).GetBinding();
+      ShaderBindIndex bind = debugger.GetPointerValue(structPointer).GetBindIndex();
 
       uint64_t byteLen = debugger.GetAPIWrapper()->GetBufferLength(bind) - offset;
 
@@ -1372,6 +1369,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
       //////////////////////////////////////////////////////////////////////////////
 
     case Op::ExtInst:
+    case Op::ExtInstWithForwardRefsKHR:
     {
       Id result = Id::fromWord(it.word(2));
       Id extinst = Id::fromWord(it.word(3));
@@ -2783,12 +2781,12 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
 
       result.type = resultType.scalar().Type();
 
-      BindpointIndex samplerIndex = DebugAPIWrapper::invalidBind;
+      ShaderBindIndex samplerIndex;
       if(sampler.type == VarType::Sampler || sampler.type == VarType::ReadOnlyResource)
-        samplerIndex = sampler.GetBinding();
+        samplerIndex = sampler.GetBindIndex();
 
       if(!debugger.GetAPIWrapper()->CalculateSampleGather(
-             *this, opdata.op, texType, img.GetBinding(), samplerIndex, uv, ddxCalc, ddyCalc,
+             *this, opdata.op, texType, img.GetBindIndex(), samplerIndex, uv, ddxCalc, ddyCalc,
              compare, gather, operands, result))
       {
         // sample failed. Pretend we got 0 columns back
@@ -2834,8 +2832,8 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
         // on the CPU for no reason (since we can't write to it)
 
         if(!debugger.GetAPIWrapper()->CalculateSampleGather(
-               *this, Op::ImageFetch, texType, img.GetBinding(), DebugAPIWrapper::invalidBind,
-               coord, ShaderVariable(), ShaderVariable(), ShaderVariable(), GatherChannel::Red,
+               *this, Op::ImageFetch, texType, img.GetBindIndex(), ShaderBindIndex(), coord,
+               ShaderVariable(), ShaderVariable(), ShaderVariable(), GatherChannel::Red,
                ImageOperandsAndParamDatas(), result))
         {
           // sample failed. Pretend we got 0 columns back
@@ -2844,7 +2842,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
       }
       else
       {
-        if(!debugger.GetAPIWrapper()->ReadTexel(img.GetBinding(), coord,
+        if(!debugger.GetAPIWrapper()->ReadTexel(img.GetBindIndex(), coord,
                                                 read.imageOperands.flags & ImageOperands::Sample
                                                     ? uintComp(GetSrc(read.imageOperands.sample), 0)
                                                     : 0,
@@ -2869,7 +2867,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
       // only the sample operand should be here
       RDCASSERT((write.imageOperands.flags & ImageOperands::Sample) == write.imageOperands.flags);
 
-      debugger.GetAPIWrapper()->WriteTexel(img.GetBinding(), coord,
+      debugger.GetAPIWrapper()->WriteTexel(img.GetBindIndex(), coord,
                                            write.imageOperands.flags & ImageOperands::Sample
                                                ? uintComp(GetSrc(write.imageOperands.sample), 0)
                                                : 0,
@@ -3171,7 +3169,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
         result.rows = result.columns = 1;
         result.type = resultType.scalar().Type();
 
-        if(!debugger.GetAPIWrapper()->ReadTexel(ptr.members[0].GetBinding(), ptr.members[1],
+        if(!debugger.GetAPIWrapper()->ReadTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
                                                 uintComp(ptr.members[2], 0), result))
         {
           // sample failed. Pretend we got 0 columns back
@@ -3199,7 +3197,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
       }
       else
       {
-        debugger.GetAPIWrapper()->WriteTexel(ptr.members[0].GetBinding(), ptr.members[1],
+        debugger.GetAPIWrapper()->WriteTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
                                              uintComp(ptr.members[2], 0), value);
       }
 
@@ -3229,14 +3227,14 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
         result.rows = result.columns = 1;
         result.type = resultType.scalar().Type();
 
-        if(!debugger.GetAPIWrapper()->ReadTexel(ptr.members[0].GetBinding(), ptr.members[1],
+        if(!debugger.GetAPIWrapper()->ReadTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
                                                 uintComp(ptr.members[2], 0), result))
         {
           // sample failed. Pretend we got 0 columns back
           RDCEraseEl(result.value);
         }
 
-        debugger.GetAPIWrapper()->WriteTexel(ptr.members[0].GetBinding(), ptr.members[1],
+        debugger.GetAPIWrapper()->WriteTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
                                              uintComp(ptr.members[2], 0), value);
       }
 
@@ -3269,7 +3267,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
         result.rows = result.columns = 1;
         result.type = resultType.scalar().Type();
 
-        if(!debugger.GetAPIWrapper()->ReadTexel(ptr.members[0].GetBinding(), ptr.members[1],
+        if(!debugger.GetAPIWrapper()->ReadTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
                                                 uintComp(ptr.members[2], 0), result))
         {
           // sample failed. Pretend we got 0 columns back
@@ -3300,7 +3298,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
         }
         else
         {
-          debugger.GetAPIWrapper()->WriteTexel(ptr.members[0].GetBinding(), ptr.members[1],
+          debugger.GetAPIWrapper()->WriteTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
                                                uintComp(ptr.members[2], 0), value);
         }
       }
@@ -3329,7 +3327,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
         result.rows = result.columns = 1;
         result.type = resultType.scalar().Type();
 
-        if(!debugger.GetAPIWrapper()->ReadTexel(ptr.members[0].GetBinding(), ptr.members[1],
+        if(!debugger.GetAPIWrapper()->ReadTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
                                                 uintComp(ptr.members[2], 0), result))
         {
           // sample failed. Pretend we got 0 columns back
@@ -3357,7 +3355,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
       }
       else
       {
-        debugger.GetAPIWrapper()->WriteTexel(ptr.members[0].GetBinding(), ptr.members[1],
+        debugger.GetAPIWrapper()->WriteTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
                                              uintComp(ptr.members[2], 0), result);
       }
       break;
@@ -3396,7 +3394,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
         result.rows = result.columns = 1;
         result.type = resultType.scalar().Type();
 
-        if(!debugger.GetAPIWrapper()->ReadTexel(ptr.members[0].GetBinding(), ptr.members[1],
+        if(!debugger.GetAPIWrapper()->ReadTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
                                                 uintComp(ptr.members[2], 0), result))
         {
           // sample failed. Pretend we got 0 columns back
@@ -3495,7 +3493,7 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
       }
       else
       {
-        debugger.GetAPIWrapper()->WriteTexel(ptr.members[0].GetBinding(), ptr.members[1],
+        debugger.GetAPIWrapper()->WriteTexel(ptr.members[0].GetBindIndex(), ptr.members[1],
                                              uintComp(ptr.members[2], 0), result);
       }
       break;
@@ -3671,11 +3669,11 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
     case Op::ImageSampleFootprintNV:
     case Op::GroupNonUniformPartitionNV:
     case Op::WritePackedPrimitiveIndices4x8NV:
-    case Op::ReportIntersectionNV:
+    case Op::ReportIntersectionKHR:
     case Op::IgnoreIntersectionNV:
     case Op::TerminateRayNV:
     case Op::TraceNV:
-    case Op::TypeAccelerationStructureNV:
+    case Op::TypeAccelerationStructureKHR:
     case Op::ExecuteCallableNV:
     case Op::TypeCooperativeMatrixNV:
     case Op::CooperativeMatrixLoadNV:
@@ -3815,6 +3813,10 @@ void ThreadState::StepNext(ShaderDebugState *state, const rdcarray<ThreadState> 
     case Op::CompositeConstructContinuedINTEL:
     case Op::MaskedGatherINTEL:
     case Op::MaskedScatterINTEL:
+    case Op::CompositeConstructReplicateEXT:
+    case Op::ConstantCompositeReplicateEXT:
+    case Op::SpecConstantCompositeReplicateEXT:
+    case Op::RawAccessChainNV:
     {
       RDCERR("Unsupported extension opcode used %s", ToStr(opdata.op).c_str());
 

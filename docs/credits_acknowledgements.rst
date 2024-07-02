@@ -136,6 +136,14 @@ The following libraries and components are incorporated into RenderDoc, listed h
 
   Provides hardware-specific counters over and above what individual hardware-agnostic graphics APIs are able to provide.
 
+* `pythoncapi-compat <https://github.com/python/pythoncapi-compat>`_ - Copyright Contributors to the pythoncapi_compat project. Distributed under the BSD Zero Clause License.
+
+  Used to simplify compatibility with a broad range of Python versions.
+
+* `intellij-community <https://github.com/JetBrains/intellij-community>`_ - Copyright Contributors to the intellij-community project. Distributed under the Apache License.
+
+  Used to generate Python stubs for binary modules.
+
 Thanks
 ------
 

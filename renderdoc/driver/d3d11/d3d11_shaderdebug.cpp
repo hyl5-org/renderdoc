@@ -77,12 +77,12 @@ public:
 
   bool CalculateSampleGather(DXBCBytecode::OpcodeType opcode,
                              DXBCDebug::SampleGatherResourceData resourceData,
-                             DXBCDebug::SampleGatherSamplerData samplerData, ShaderVariable uv,
-                             ShaderVariable ddxCalc, ShaderVariable ddyCalc,
-                             const int8_t texelOffsets[3], int multisampleIndex,
-                             float lodOrCompareValue, const uint8_t swizzle[4],
-                             DXBCDebug::GatherChannel gatherChannel, const char *opString,
-                             ShaderVariable &output);
+                             DXBCDebug::SampleGatherSamplerData samplerData,
+                             const ShaderVariable &uvIn, const ShaderVariable &ddxCalcIn,
+                             const ShaderVariable &ddyCalcIn, const int8_t texelOffsets[3],
+                             int multisampleIndex, float lodOrCompareValue,
+                             const uint8_t swizzle[4], DXBCDebug::GatherChannel gatherChannel,
+                             const char *opString, ShaderVariable &output);
 
 private:
   DXBC::ShaderType GetShaderType() { return m_dxbc ? m_dxbc->m_Type : DXBC::ShaderType::Pixel; }
@@ -1035,42 +1035,41 @@ ShaderVariable D3D11DebugAPIWrapper::GetResourceInfo(DXBCBytecode::OperandType t
 
 bool D3D11DebugAPIWrapper::CalculateSampleGather(
     DXBCBytecode::OpcodeType opcode, DXBCDebug::SampleGatherResourceData resourceData,
-    DXBCDebug::SampleGatherSamplerData samplerData, ShaderVariable uv, ShaderVariable ddxCalc,
-    ShaderVariable ddyCalc, const int8_t texelOffsets[3], int multisampleIndex,
-    float lodOrCompareValue, const uint8_t swizzle[4], DXBCDebug::GatherChannel gatherChannel,
-    const char *opString, ShaderVariable &output)
+    DXBCDebug::SampleGatherSamplerData samplerData, const ShaderVariable &uvIn,
+    const ShaderVariable &ddxCalcIn, const ShaderVariable &ddyCalcIn, const int8_t texelOffsets[3],
+    int multisampleIndex, float lodOrCompareValue, const uint8_t swizzle[4],
+    DXBCDebug::GatherChannel gatherChannel, const char *opString, ShaderVariable &output)
 {
   using namespace DXBCBytecode;
 
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE == DEBUG_SAMPLE_TEX_SAMPLE,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE_L == DEBUG_SAMPLE_TEX_SAMPLE_L,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE_B == DEBUG_SAMPLE_TEX_SAMPLE_B,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE_C == DEBUG_SAMPLE_TEX_SAMPLE_C,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE_D == DEBUG_SAMPLE_TEX_SAMPLE_D,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SAMPLE_C_LZ == DEBUG_SAMPLE_TEX_SAMPLE_C_LZ,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_GATHER4 == DEBUG_SAMPLE_TEX_GATHER4,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_GATHER4_C == DEBUG_SAMPLE_TEX_GATHER4_C,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_GATHER4_PO == DEBUG_SAMPLE_TEX_GATHER4_PO,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_GATHER4_PO_C == DEBUG_SAMPLE_TEX_GATHER4_PO_C,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_LOD == DEBUG_SAMPLE_TEX_LOD,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_LD == DEBUG_SAMPLE_TEX_LD,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_LD_MS == DEBUG_SAMPLE_TEX_LD_MS,
-                    "Opcode enum doesn't match shader define");
+  int sampleOp;
+  switch(opcode)
+  {
+    case OPCODE_SAMPLE: sampleOp = DEBUG_SAMPLE_TEX_SAMPLE; break;
+    case OPCODE_SAMPLE_L: sampleOp = DEBUG_SAMPLE_TEX_SAMPLE_LEVEL; break;
+    case OPCODE_SAMPLE_B: sampleOp = DEBUG_SAMPLE_TEX_SAMPLE_BIAS; break;
+    case OPCODE_SAMPLE_C: sampleOp = DEBUG_SAMPLE_TEX_SAMPLE_CMP; break;
+    case OPCODE_SAMPLE_D: sampleOp = DEBUG_SAMPLE_TEX_SAMPLE_GRAD; break;
+    case OPCODE_SAMPLE_C_LZ: sampleOp = DEBUG_SAMPLE_TEX_SAMPLE_CMP_LEVEL_ZERO; break;
+    case OPCODE_GATHER4: sampleOp = DEBUG_SAMPLE_TEX_GATHER4; break;
+    case OPCODE_GATHER4_C: sampleOp = DEBUG_SAMPLE_TEX_GATHER4_CMP; break;
+    case OPCODE_GATHER4_PO: sampleOp = DEBUG_SAMPLE_TEX_GATHER4_PO; break;
+    case OPCODE_GATHER4_PO_C: sampleOp = DEBUG_SAMPLE_TEX_GATHER4_PO_CMP; break;
+    case OPCODE_LOD: sampleOp = DEBUG_SAMPLE_TEX_LOD; break;
+    case OPCODE_LD: sampleOp = DEBUG_SAMPLE_TEX_LOAD; break;
+    case OPCODE_LD_MS: sampleOp = DEBUG_SAMPLE_TEX_LOAD_MS; break;
+    default:
+      // To support a new instruction, the shader created in
+      // ShaderDebugging::Init() will need updating
+      RDCERR("Unsupported instruction for CalculateSampleGather: %u", opcode);
+      return false;
+  }
 
   ShaderDebugging &debugData = m_pDevice->GetReplay()->GetShaderDebuggingData();
 
+  ShaderVariable uv(uvIn);
+  ShaderVariable ddxCalc(ddxCalcIn);
+  ShaderVariable ddyCalc(ddyCalcIn);
   for(uint32_t i = 0; i < ddxCalc.columns; i++)
   {
     if(!RDCISFINITE(ddxCalc.value.f32v[i]))
@@ -1174,7 +1173,7 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
 
   cbufferData.debugSampleGatherChannel = (int)gatherChannel;
   cbufferData.debugSampleSampleIndex = multisampleIndex;
-  cbufferData.debugSampleOperation = (int)opcode;
+  cbufferData.debugSampleOperation = sampleOp;
   cbufferData.debugSampleLodCompare = lodOrCompareValue;
 
   D3D11RenderStateTracker tracker(m_pDevice->GetImmediateContext());
@@ -1226,10 +1225,23 @@ bool D3D11DebugAPIWrapper::CalculateSampleGather(
   context->PSSetShaderResources(texSlot, 1, &usedSRV);
   if(opcode == OPCODE_SAMPLE_B && samplerData.bias != 0.0f)
   {
-    RDCASSERT(usedSamp);
+    D3D11_SAMPLER_DESC desc = {};
 
-    D3D11_SAMPLER_DESC desc;
-    usedSamp->GetDesc(&desc);
+    if(usedSamp)
+    {
+      usedSamp->GetDesc(&desc);
+    }
+    else
+    {
+      desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+      desc.AddressU = desc.AddressV = desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+      desc.MipLODBias = 0.0f;
+      desc.MaxAnisotropy = 1;
+      desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+      desc.BorderColor[0] = desc.BorderColor[1] = desc.BorderColor[2] = desc.BorderColor[3] = 1.0f;
+      desc.MinLOD = -FLT_MAX;
+      desc.MaxLOD = FLT_MAX;
+    }
 
     desc.MipLODBias = RDCCLAMP(desc.MipLODBias + samplerData.bias, -15.99f, 15.99f);
 
@@ -1344,16 +1356,20 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
 {
   D3D11RenderStateTracker tracker(m_pDevice->GetImmediateContext());
 
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_RCP == DEBUG_SAMPLE_MATH_RCP,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_RSQ == DEBUG_SAMPLE_MATH_RSQ,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_EXP == DEBUG_SAMPLE_MATH_EXP,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_LOG == DEBUG_SAMPLE_MATH_LOG,
-                    "Opcode enum doesn't match shader define");
-  RDCCOMPILE_ASSERT((int)DXBCBytecode::OPCODE_SINCOS == DEBUG_SAMPLE_MATH_SINCOS,
-                    "Opcode enum doesn't match shader define");
+  int mathOp = 0;
+  switch(opcode)
+  {
+    case DXBCBytecode::OPCODE_RCP: mathOp = DEBUG_SAMPLE_MATH_DXBC_RCP; break;
+    case DXBCBytecode::OPCODE_RSQ: mathOp = DEBUG_SAMPLE_MATH_DXBC_RSQ; break;
+    case DXBCBytecode::OPCODE_EXP: mathOp = DEBUG_SAMPLE_MATH_DXBC_EXP; break;
+    case DXBCBytecode::OPCODE_LOG: mathOp = DEBUG_SAMPLE_MATH_DXBC_LOG; break;
+    case DXBCBytecode::OPCODE_SINCOS: mathOp = DEBUG_SAMPLE_MATH_DXBC_SINCOS; break;
+    default:
+      // To support a new instruction, the shader created in
+      // ShaderDebugging::Init() will need updating
+      RDCERR("Unsupported instruction for CalculateMathIntrinsic: %u", opcode);
+      return false;
+  }
 
   ID3D11DeviceContext *context = NULL;
   m_pDevice->GetImmediateContext(&context);
@@ -1369,7 +1385,7 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
   }
 
   DebugMathOperation data;
-  data.mathOp = (int)opcode;
+  data.mathOp = mathOp;
   memcpy(&data.mathInVal, &input.value.u32v[0], sizeof(Vec4f));
 
   memcpy(mapped.pData, &data, sizeof(data));
@@ -1407,8 +1423,7 @@ bool D3D11DebugAPIWrapper::CalculateMathIntrinsic(DXBCBytecode::OpcodeType opcod
 void AddCBuffersToGlobalState(const DXBCBytecode::Program &program, D3D11DebugManager &debugManager,
                               DXBCDebug::GlobalState &global,
                               rdcarray<SourceVariableMapping> &sourceVars,
-                              const D3D11RenderState::Shader &shader, const ShaderReflection &refl,
-                              const ShaderBindpointMapping &mapping)
+                              const D3D11RenderState::Shader &shader, const ShaderReflection &refl)
 {
   bytebuf cbufData;
   for(int i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; i++)
@@ -1420,7 +1435,7 @@ void AddCBuffersToGlobalState(const DXBCBytecode::Program &program, D3D11DebugMa
       debugManager.GetBufferData(shader.ConstantBuffers[i], shader.CBOffsets[i] * sizeof(Vec4f),
                                  shader.CBCounts[i] * sizeof(Vec4f), cbufData);
 
-      AddCBufferToGlobalState(program, global, sourceVars, refl, mapping, slot, cbufData);
+      AddCBufferToGlobalState(program, global, sourceVars, refl, slot, cbufData);
     }
   }
 }
@@ -1454,7 +1469,7 @@ ShaderDebugTrace *D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, ui
   if(!dxbc)
     return new ShaderDebugTrace;
 
-  dxbc->GetDisassembly();
+  dxbc->GetDisassembly(false);
 
   D3D11RenderState *rs = m_pImmediateContext->GetCurrentPipelineState();
 
@@ -1520,12 +1535,12 @@ ShaderDebugTrace *D3D11Replay::DebugVertex(uint32_t eventId, uint32_t vertid, ui
 
   InterpretDebugger *interpreter = new InterpretDebugger;
   interpreter->eventId = eventId;
-  ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, vs->GetMapping(), 0);
+  ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, 0);
   GlobalState &global = interpreter->global;
   ThreadState &state = interpreter->activeLane();
 
   AddCBuffersToGlobalState(*dxbc->GetDXBCByteCode(), *GetDebugManager(), global, ret->sourceVars,
-                           rs->VS, refl, vs->GetMapping());
+                           rs->VS, refl);
 
   for(size_t i = 0; i < state.inputs.size(); i++)
   {
@@ -1845,7 +1860,7 @@ ShaderDebugTrace *D3D11Replay::DebugPixel(uint32_t eventId, uint32_t x, uint32_t
   if(!dxbc)
     return new ShaderDebugTrace;
 
-  dxbc->GetDisassembly();
+  dxbc->GetDisassembly(false);
 
   DXBC::DXBCContainer *prevdxbc = NULL;
 
@@ -2438,12 +2453,12 @@ void ExtractInputsPS(PSInput IN, float4 debug_pixelPos : SV_Position,
 
   InterpretDebugger *interpreter = new InterpretDebugger;
   interpreter->eventId = eventId;
-  ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, ps->GetMapping(), destIdx);
+  ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, destIdx);
   GlobalState &global = interpreter->global;
   ThreadState &state = interpreter->activeLane();
 
   AddCBuffersToGlobalState(*dxbc->GetDXBCByteCode(), *GetDebugManager(), global, ret->sourceVars,
-                           rs->PS, refl, ps->GetMapping());
+                           rs->PS, refl);
 
   global.sampleEvalRegisterMask = sampleEvalRegisterMask;
 
@@ -2587,18 +2602,18 @@ ShaderDebugTrace *D3D11Replay::DebugThread(uint32_t eventId,
   if(!dxbc)
     return new ShaderDebugTrace;
 
-  dxbc->GetDisassembly();
+  dxbc->GetDisassembly(false);
 
   D3D11RenderState *rs = m_pImmediateContext->GetCurrentPipelineState();
 
   InterpretDebugger *interpreter = new InterpretDebugger;
   interpreter->eventId = eventId;
-  ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, cs->GetMapping(), 0);
+  ShaderDebugTrace *ret = interpreter->BeginDebug(dxbc, refl, 0);
   GlobalState &global = interpreter->global;
   ThreadState &state = interpreter->activeLane();
 
   AddCBuffersToGlobalState(*dxbc->GetDXBCByteCode(), *GetDebugManager(), global, ret->sourceVars,
-                           rs->CS, refl, cs->GetMapping());
+                           rs->CS, refl);
 
   for(int i = 0; i < 3; i++)
   {

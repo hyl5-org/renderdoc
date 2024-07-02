@@ -569,9 +569,16 @@ rdcstr D3D12ShaderCache::GetShaderBlob(const char *source, const char *entry,
           {{"hlsl_texsample.h", texSampleBlob}, {"hlsl_cbuffers.h", cBufferBlob}});
 
       IDxcOperationResult *result = NULL;
+      uint32_t flags = DXBC::DecodeFlags(compileFlags) & ~D3DCOMPILE_NO_PRESHADER;
+      rdcarray<rdcwstr> argsData;
+      DXBC::EncodeDXCFlags(flags, argsData);
+      rdcarray<LPCWSTR> arguments;
+      for(const rdcwstr &arg : argsData)
+        arguments.push_back(arg.c_str());
+
       hr = compiler->Compile(sourceBlob, NULL, StringFormat::UTF82Wide(entry).c_str(),
-                             StringFormat::UTF82Wide(profile).c_str(), NULL, (UINT)0, NULL, 0,
-                             &includeHandler, &result);
+                             StringFormat::UTF82Wide(profile).c_str(), arguments.data(),
+                             arguments.count(), NULL, 0, &includeHandler, &result);
 
       SAFE_RELEASE(sourceBlob);
 
@@ -767,8 +774,14 @@ D3D12RootSignature D3D12ShaderCache::GetRootSig(const void *data, size_t dataSiz
   }
 
   ID3D12VersionedRootSignatureDeserializer *deser = NULL;
-  HRESULT hr = deserializeRootSig(
-      data, dataSize, __uuidof(ID3D12VersionedRootSignatureDeserializer), (void **)&deser);
+  HRESULT hr;
+
+  if(m_DevConfig)
+    hr = m_DevConfig->devconfig->CreateVersionedRootSignatureDeserializer(
+        data, dataSize, __uuidof(ID3D12VersionedRootSignatureDeserializer), (void **)&deser);
+  else
+    hr = deserializeRootSig(data, dataSize, __uuidof(ID3D12VersionedRootSignatureDeserializer),
+                            (void **)&deser);
 
   if(FAILED(hr))
   {
@@ -966,7 +979,12 @@ ID3DBlob *D3D12ShaderCache::MakeRootSig(const rdcarray<D3D12_ROOT_PARAMETER1> &p
 
   ID3DBlob *ret = NULL;
   ID3DBlob *errBlob = NULL;
-  HRESULT hr = serializeRootSig(&verdesc, &ret, &errBlob);
+  HRESULT hr;
+
+  if(m_DevConfig && m_DevConfig->devconfig)
+    hr = m_DevConfig->devconfig->SerializeVersionedRootSignature(&verdesc, &ret, &errBlob);
+  else
+    hr = serializeRootSig(&verdesc, &ret, &errBlob);
   SAFE_RELEASE(errBlob);
 
   if(SUCCEEDED(hr))
@@ -981,7 +999,10 @@ ID3DBlob *D3D12ShaderCache::MakeRootSig(const rdcarray<D3D12_ROOT_PARAMETER1> &p
     oldSamplers[i] = Downconvert(StaticSamplers[i]);
   desc11.pStaticSamplers = oldSamplers.data();
 
-  hr = serializeRootSig(&verdesc, &ret, &errBlob);
+  if(m_DevConfig && m_DevConfig->devconfig)
+    hr = m_DevConfig->devconfig->SerializeVersionedRootSignature(&verdesc, &ret, &errBlob);
+  else
+    hr = serializeRootSig(&verdesc, &ret, &errBlob);
 
   if(FAILED(hr))
   {
@@ -1043,6 +1064,39 @@ ID3DBlob *D3D12ShaderCache::MakeFixedColShader(FixedColVariant variant, bool dxi
 ID3DBlob *D3D12ShaderCache::GetQuadShaderDXILBlob()
 {
   rdcstr embedded = GetEmbeddedResource(quadwrite_dxbc);
+  if(embedded.empty() || !embedded.beginsWith("DXBC"))
+    return NULL;
+
+  ID3DBlob *ret = NULL;
+  D3D12ShaderCacheCallbacks.Create((uint32_t)embedded.size(), embedded.data(), &ret);
+  return ret;
+}
+
+ID3DBlob *D3D12ShaderCache::GetPrimitiveIDShaderDXILBlob()
+{
+  rdcstr embedded = GetEmbeddedResource(pixelhistory_primitiveid_dxbc);
+  if(embedded.empty() || !embedded.beginsWith("DXBC"))
+    return NULL;
+
+  ID3DBlob *ret = NULL;
+  D3D12ShaderCacheCallbacks.Create((uint32_t)embedded.size(), embedded.data(), &ret);
+  return ret;
+}
+
+ID3DBlob *D3D12ShaderCache::GetFixedColorShaderDXILBlob(uint32_t variant)
+{
+  const rdcstr variants[] = {
+      GetEmbeddedResource(pixelhistory_fixedcol_0_dxbc),
+      GetEmbeddedResource(pixelhistory_fixedcol_1_dxbc),
+      GetEmbeddedResource(pixelhistory_fixedcol_2_dxbc),
+      GetEmbeddedResource(pixelhistory_fixedcol_3_dxbc),
+      GetEmbeddedResource(pixelhistory_fixedcol_4_dxbc),
+      GetEmbeddedResource(pixelhistory_fixedcol_5_dxbc),
+      GetEmbeddedResource(pixelhistory_fixedcol_6_dxbc),
+      GetEmbeddedResource(pixelhistory_fixedcol_7_dxbc),
+  };
+
+  const rdcstr embedded = variants[variant];
   if(embedded.empty() || !embedded.beginsWith("DXBC"))
     return NULL;
 

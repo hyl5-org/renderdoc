@@ -1090,9 +1090,15 @@ bool WrappedVulkan::Serialise_vkBeginCommandBuffer(SerialiserType &ser, VkComman
     if(IsLoading(m_State))
     {
       for(int p = 0; p < 2; p++)
+      {
         for(size_t i = 0; i < ARRAY_COUNT(BakedCmdBufferInfo::pushDescriptorID[p]); i++)
-          m_BakedCmdBufferInfo[BakedCommandBuffer].pushDescriptorID[p][i] =
-              ResourceIDGen::GetNewUniqueID();
+        {
+          VkDescriptorSet descset = MakeFakePushDescSet();
+          ResourceId id = GetResourceManager()->WrapResource(Unwrap(device), descset);
+          m_BakedCmdBufferInfo[BakedCommandBuffer].pushDescriptorID[p][i] = id;
+          GetResourceManager()->AddLiveResource(id, descset);
+        }
+      }
     }
 
     // clear/invalidate descriptor set state for this command buffer.
@@ -1169,50 +1175,35 @@ bool WrappedVulkan::Serialise_vkBeginCommandBuffer(SerialiserType &ser, VkComman
 
     if(IsActiveReplaying(m_State))
     {
-      const uint32_t length = m_BakedCmdBufferInfo[BakedCommandBuffer].eventCount;
+      const rdcarray<CommandBufferNode *> &submits = m_Partial.submitLookup[BakedCommandBuffer];
 
       bool rerecord = false;
-      bool partial = false;
-      int partialType = ePartialNum;
 
       // check for partial execution of this command buffer
-      for(int p = 0; p < ePartialNum; p++)
+      for(const CommandBufferNode *submit : submits)
       {
-        const rdcarray<Submission> &submissions = m_Partial[p].cmdBufferSubmits[BakedCommandBuffer];
-
-        for(auto it = submissions.begin(); it != submissions.end(); ++it)
+        if(IsEventInCommandBuffer(submit, m_LastEventID,
+                                  m_BakedCmdBufferInfo[BakedCommandBuffer].eventCount))
         {
-          if(RDCMAX(1U, it->baseEvent) - 1 <= m_LastEventID &&
-             m_LastEventID < (it->baseEvent + length))
-          {
+          SetPartialStack(submit, m_LastEventID);
+
+          GetCmdRenderState().xfbcounters.clear();
+          GetCmdRenderState().conditionalRendering.buffer = ResourceId();
+
+          m_PushCommandBuffer = m_LastCmdBufferID;
+
+          rerecord = true;
+        }
+        else if(submit->beginEvent <= m_LastEventID)
+        {
 #if ENABLED(VERBOSE_PARTIAL_REPLAY)
-            RDCDEBUG("vkBegin - partial detected %u < %u < %u, %s -> %s", it->baseEvent,
-                     m_LastEventID, it->baseEvent + length, ToStr(CommandBuffer).c_str(),
-                     ToStr(BakedCommandBuffer).c_str());
+          RDCDEBUG("vkBegin - full re-record detected %u < %u <= %u, %s -> %s", it->baseEvent,
+                   it->baseEvent + length, m_LastEventID, ToStr(CommandBuffer).c_str(),
+                   ToStr(BakedCommandBuffer).c_str());
 #endif
 
-            m_Partial[p].partialParent = BakedCommandBuffer;
-            m_Partial[p].baseEvent = it->baseEvent;
-            m_Partial[p].renderPassActive = false;
-
-            GetCmdRenderState().xfbcounters.clear();
-            GetCmdRenderState().conditionalRendering.buffer = ResourceId();
-
-            rerecord = true;
-            partial = true;
-            partialType = p;
-          }
-          else if(it->baseEvent <= m_LastEventID)
-          {
-#if ENABLED(VERBOSE_PARTIAL_REPLAY)
-            RDCDEBUG("vkBegin - full re-record detected %u < %u <= %u, %s -> %s", it->baseEvent,
-                     it->baseEvent + length, m_LastEventID, ToStr(CommandBuffer).c_str(),
-                     ToStr(BakedCommandBuffer).c_str());
-#endif
-
-            // this submission is completely within the range, so it should still be re-recorded
-            rerecord = true;
-          }
+          // this submission is completely within the range, so it should still be re-recorded
+          rerecord = true;
         }
       }
 
@@ -1472,22 +1463,19 @@ bool WrappedVulkan::Serialise_vkEndCommandBuffer(SerialiserType &ser, VkCommandB
 #endif
 
         VulkanRenderState &renderstate = GetCmdRenderState();
-        if(m_Partial[Primary].partialParent == BakedCommandBuffer && !renderstate.xfbcounters.empty())
-        {
-          renderstate.EndTransformFeedback(this, commandBuffer);
-        }
 
-        if(m_Partial[Primary].partialParent == BakedCommandBuffer &&
-           renderstate.IsConditionalRenderingEnabled())
+        if(IsCommandBufferPartialPrimary(BakedCommandBuffer))
         {
-          renderstate.EndConditionalRendering(commandBuffer);
+          if(!renderstate.xfbcounters.empty())
+            renderstate.EndTransformFeedback(this, commandBuffer);
+
+          if(renderstate.IsConditionalRenderingEnabled())
+            renderstate.EndConditionalRendering(commandBuffer);
         }
 
         // finish any render pass that was still active in the primary partial parent
-        if((m_Partial[Primary].partialParent == BakedCommandBuffer &&
-            m_Partial[Primary].renderPassActive) ||
-           (m_Partial[Secondary].partialParent == BakedCommandBuffer &&
-            m_Partial[Secondary].renderPassActive))
+        if(IsCommandBufferPartial(m_LastCmdBufferID) &&
+           GetCommandBufferPartialSubmission(m_LastCmdBufferID)->renderPassActive)
         {
           if(m_BakedCmdBufferInfo[m_LastCmdBufferID].renderPassOpen)
           {
@@ -1780,10 +1768,10 @@ bool WrappedVulkan::Serialise_vkCmdBeginRenderPass(SerialiserType &ser, VkComman
         commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
 
         // only if we're partially recording do we update this state
-        if(ShouldUpdateRenderState(m_LastCmdBufferID, true))
+        if(ShouldUpdateRenderpassActive(m_LastCmdBufferID, false))
         {
-          m_Partial[Primary].renderPassActive = true;
-          m_BakedCmdBufferInfo[m_LastCmdBufferID].renderPassOpen = true;
+          GetCommandBufferPartialSubmission(m_LastCmdBufferID)->renderPassActive =
+              m_BakedCmdBufferInfo[m_LastCmdBufferID].renderPassOpen = true;
         }
 
         m_BakedCmdBufferInfo[m_LastCmdBufferID].activeSubpass = 0;
@@ -2236,9 +2224,10 @@ bool WrappedVulkan::Serialise_vkCmdEndRenderPass(SerialiserType &ser, VkCommandB
 
         rdcarray<VkImageMemoryBarrier> imgBarriers = GetImplicitRenderPassBarriers(~0U);
 
-        if(ShouldUpdateRenderState(m_LastCmdBufferID, true))
+        // only if we're partially recording do we update this state
+        if(ShouldUpdateRenderpassActive(m_LastCmdBufferID, false))
         {
-          m_Partial[Primary].renderPassActive =
+          GetCommandBufferPartialSubmission(m_LastCmdBufferID)->renderPassActive =
               m_BakedCmdBufferInfo[m_LastCmdBufferID].renderPassOpen = false;
         }
 
@@ -2441,9 +2430,9 @@ bool WrappedVulkan::Serialise_vkCmdBeginRenderPass2(SerialiserType &ser,
         commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
 
         // only if we're partially recording do we update this state
-        if(ShouldUpdateRenderState(m_LastCmdBufferID, true))
+        if(ShouldUpdateRenderpassActive(m_LastCmdBufferID, false))
         {
-          m_Partial[Primary].renderPassActive =
+          GetCommandBufferPartialSubmission(m_LastCmdBufferID)->renderPassActive =
               m_BakedCmdBufferInfo[m_LastCmdBufferID].renderPassOpen = true;
         }
 
@@ -2930,9 +2919,10 @@ bool WrappedVulkan::Serialise_vkCmdEndRenderPass2(SerialiserType &ser, VkCommand
 
         rdcarray<VkImageMemoryBarrier> imgBarriers = GetImplicitRenderPassBarriers(~0U);
 
-        if(ShouldUpdateRenderState(m_LastCmdBufferID, true))
+        // only if we're partially recording do we update this state
+        if(ShouldUpdateRenderpassActive(m_LastCmdBufferID, false))
         {
-          m_Partial[Primary].renderPassActive =
+          GetCommandBufferPartialSubmission(m_LastCmdBufferID)->renderPassActive =
               m_BakedCmdBufferInfo[m_LastCmdBufferID].renderPassOpen = false;
         }
 
@@ -3108,10 +3098,27 @@ bool WrappedVulkan::Serialise_vkCmdBindPipeline(SerialiserType &ser, VkCommandBu
           if(pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE)
           {
             renderstate.compute.pipeline = liveid;
+            renderstate.compute.shaderObject = false;
+
+            // disturb compute shader bound via vkCmdBindShadersEXT, if any
+            renderstate.shaderObjects[(uint32_t)ShaderStage::Compute] = ResourceId();
+          }
+          else if(pipelineBindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)
+          {
+            renderstate.rt.pipeline = liveid;
           }
           else
           {
             renderstate.graphics.pipeline = liveid;
+            renderstate.graphics.shaderObject = false;
+
+            // disturb graphics shaders bound via vkCmdBindShadersEXT, if any
+            for(uint32_t i = 0; i < (uint32_t)ShaderStage::Count; i++)
+            {
+              if(i == (uint32_t)ShaderStage::Compute)
+                continue;
+              renderstate.shaderObjects[i] = ResourceId();
+            }
 
             const VulkanCreationInfo::Pipeline &pipeInfo = m_CreationInfo.m_Pipeline[liveid];
 
@@ -3428,10 +3435,17 @@ bool WrappedVulkan::Serialise_vkCmdBindPipeline(SerialiserType &ser, VkCommandBu
       if(pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE)
       {
         m_BakedCmdBufferInfo[m_LastCmdBufferID].state.compute.pipeline = liveid;
+        m_BakedCmdBufferInfo[m_LastCmdBufferID].state.compute.shaderObject = false;
+      }
+      else if(pipelineBindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)
+      {
+        m_BakedCmdBufferInfo[m_LastCmdBufferID].state.rt.pipeline = liveid;
+        m_BakedCmdBufferInfo[m_LastCmdBufferID].state.rt.shaderObject = false;
       }
       else
       {
         m_BakedCmdBufferInfo[m_LastCmdBufferID].state.graphics.pipeline = liveid;
+        m_BakedCmdBufferInfo[m_LastCmdBufferID].state.graphics.shaderObject = false;
 
         const VulkanCreationInfo::Pipeline &pipeInfo = m_CreationInfo.m_Pipeline[liveid];
 
@@ -3510,18 +3524,14 @@ bool WrappedVulkan::Serialise_vkCmdBindDescriptorSets(
         {
           VulkanRenderState &renderstate = GetCmdRenderState();
 
-          rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descsets =
-              (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) ? renderstate.graphics.descSets
-                                                                     : renderstate.compute.descSets;
+          VulkanStatePipeline &pipeline = renderstate.GetPipeline(pipelineBindPoint);
+          rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descsets = pipeline.descSets;
 
           // expand as necessary
           if(descsets.size() < firstSet + setCount)
             descsets.resize(firstSet + setCount);
 
-          if(pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
-            renderstate.graphics.lastBoundSet = firstSet;
-          else
-            renderstate.compute.lastBoundSet = firstSet;
+          pipeline.lastBoundSet = firstSet;
 
           const rdcarray<ResourceId> &descSetLayouts =
               m_CreationInfo.m_PipelineLayout[GetResID(layout)].descSetLayouts;
@@ -3553,9 +3563,7 @@ bool WrappedVulkan::Serialise_vkCmdBindDescriptorSets(
     {
       // track while reading, as we need to track resource usage
       rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descsets =
-          (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
-              ? m_BakedCmdBufferInfo[m_LastCmdBufferID].state.graphics.descSets
-              : m_BakedCmdBufferInfo[m_LastCmdBufferID].state.compute.descSets;
+          m_BakedCmdBufferInfo[m_LastCmdBufferID].state.GetPipeline(pipelineBindPoint).descSets;
 
       // expand as necessary
       if(descsets.size() < firstSet + setCount)
@@ -3937,6 +3945,8 @@ bool WrappedVulkan::Serialise_vkCmdPushConstants(SerialiserType &ser, VkCommandB
 
           renderstate.pushConstSize = RDCMAX(renderstate.pushConstSize, start + length);
           renderstate.pushLayout = GetResID(layout);
+
+          m_PushCommandBuffer = m_LastCmdBufferID;
         }
       }
     }
@@ -4704,6 +4714,24 @@ void WrappedVulkan::vkCmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPo
   }
 }
 
+void WrappedVulkan::UpdateRenderStateForSecondaries(BakedCmdBufferInfo &ancestorCB,
+                                                    BakedCmdBufferInfo &currentCB)
+{
+  currentCB.state.SetRenderPass(ancestorCB.state.GetRenderPass());
+  currentCB.state.subpass = ancestorCB.state.subpass;
+  currentCB.state.dynamicRendering = ancestorCB.state.dynamicRendering;
+  currentCB.state.SetFramebuffer(ancestorCB.state.GetFramebuffer(),
+                                 ancestorCB.state.GetFramebufferAttachments());
+  currentCB.state.renderArea = ancestorCB.state.renderArea;
+  currentCB.state.subpassContents = ancestorCB.state.subpassContents;
+
+  if(currentCB.action)
+  {
+    for(const ResourceId &childCB : currentCB.action->executedCmds)
+      UpdateRenderStateForSecondaries(ancestorCB, m_BakedCmdBufferInfo[childCB]);
+  }
+}
+
 template <typename SerialiserType>
 bool WrappedVulkan::Serialise_vkCmdExecuteCommands(SerialiserType &ser, VkCommandBuffer commandBuffer,
                                                    uint32_t commandBufferCount,
@@ -4814,8 +4842,13 @@ bool WrappedVulkan::Serialise_vkCmdExecuteCommands(SerialiserType &ser, VkComman
           parentCmdBufInfo.debugMessages.back().eventId += parentCmdBufInfo.curEventID;
         }
 
-        // only primary command buffers can be submitted
-        m_Partial[Secondary].cmdBufferSubmits[cmd].push_back(parentCmdBufInfo.curEventID);
+        // Record execution of the secondary command buffer in the parent's CommandBufferNode
+        // Only primary command buffers can be submitted
+        CommandBufferExecuteInfo execInfo;
+        execInfo.cmdId = cmd;
+        execInfo.relPos = parentCmdBufInfo.curEventID;
+
+        m_CommandBufferExecutes[m_LastCmdBufferID].push_back(execInfo);
 
         parentCmdBufInfo.action->executedCmds.push_back(cmd);
 
@@ -4875,12 +4908,14 @@ bool WrappedVulkan::Serialise_vkCmdExecuteCommands(SerialiserType &ser, VkComman
         parentCmdBufInfo.curEventID++;
 
         bool fullRecord = false;
-        uint32_t startEID = parentCmdBufInfo.curEventID + m_Partial[Primary].baseEvent;
+        uint32_t startEID = parentCmdBufInfo.curEventID;
+        if(IsCommandBufferPartial(m_LastCmdBufferID))
+          startEID += GetCommandBufferPartialSubmission(m_LastCmdBufferID)->beginEvent;
 
         // if we're in the re-record range and this command buffer isn't partial, we execute all
         // command buffers because m_Partial[Primary].baseEvent above is only valid for the partial
         // command buffer
-        if(m_Partial[Primary].partialParent != m_LastCmdBufferID)
+        if(!IsCommandBufferPartial(m_LastCmdBufferID))
         {
 #if ENABLED(VERBOSE_PARTIAL_REPLAY)
           RDCDEBUG("Fully re-recording non-partial execute in command buffer %s for %s",
@@ -4898,15 +4933,7 @@ bool WrappedVulkan::Serialise_vkCmdExecuteCommands(SerialiserType &ser, VkComman
           // activated inside the secondary which we should not overwrite.
           if(parentCmdBufInfo.state.ActiveRenderPass())
           {
-            m_BakedCmdBufferInfo[cmd].state.SetRenderPass(parentCmdBufInfo.state.GetRenderPass());
-            m_BakedCmdBufferInfo[cmd].state.subpass = parentCmdBufInfo.state.subpass;
-            m_BakedCmdBufferInfo[cmd].state.dynamicRendering =
-                parentCmdBufInfo.state.dynamicRendering;
-            m_BakedCmdBufferInfo[cmd].state.SetFramebuffer(
-                parentCmdBufInfo.state.GetFramebuffer(),
-                parentCmdBufInfo.state.GetFramebufferAttachments());
-            m_BakedCmdBufferInfo[cmd].state.renderArea = parentCmdBufInfo.state.renderArea;
-            m_BakedCmdBufferInfo[cmd].state.subpassContents = parentCmdBufInfo.state.subpassContents;
+            UpdateRenderStateForSecondaries(parentCmdBufInfo, m_BakedCmdBufferInfo[cmd]);
           }
 
           // 2 extra for the virtual labels around the command buffer
@@ -5372,6 +5399,26 @@ void WrappedVulkan::ApplyPushDescriptorWrites(VkPipelineBindPoint pipelineBindPo
                                  layoutBinding->immutableSampler == NULL);
       }
     }
+    else if(writeDesc.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
+    {
+      VkWriteDescriptorSetAccelerationStructureKHR *asWrite =
+          (VkWriteDescriptorSetAccelerationStructureKHR *)FindNextStruct(
+              &writeDesc, VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR);
+      for(uint32_t d = 0; d < writeDesc.descriptorCount; d++, curIdx++)
+      {
+        // allow consecutive descriptor bind updates. See vkUpdateDescriptorSets for more
+        // explanation
+        if(curIdx >= layoutBinding->descriptorCount)
+        {
+          layoutBinding++;
+          bind++;
+          curIdx = 0;
+        }
+
+        (*bind)[curIdx].SetAccelerationStructure(writeDesc.descriptorType,
+                                                 asWrite->pAccelerationStructures[d]);
+      }
+    }
     else if(writeDesc.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
     {
       VkWriteDescriptorSetInlineUniformBlock *inlineWrite =
@@ -5433,18 +5480,14 @@ bool WrappedVulkan::Serialise_vkCmdPushDescriptorSetKHR(SerialiserType &ser,
 
         {
           VulkanRenderState &renderstate = GetCmdRenderState();
-          rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descsets =
-              (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) ? renderstate.graphics.descSets
-                                                                     : renderstate.compute.descSets;
+          VulkanStatePipeline &pipeline = renderstate.GetPipeline(pipelineBindPoint);
+          rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descsets = pipeline.descSets;
 
           // expand as necessary
           if(descsets.size() < set + 1)
             descsets.resize(set + 1);
 
-          if(pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
-            renderstate.graphics.lastBoundSet = set;
-          else
-            renderstate.compute.lastBoundSet = set;
+          pipeline.lastBoundSet = set;
 
           descsets[set].pipeLayout = GetResID(layout);
           descsets[set].descSet = setId;
@@ -5461,9 +5504,7 @@ bool WrappedVulkan::Serialise_vkCmdPushDescriptorSetKHR(SerialiserType &ser,
     {
       // track while reading, as we need to track resource usage
       rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descsets =
-          (pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
-              ? m_BakedCmdBufferInfo[m_LastCmdBufferID].state.graphics.descSets
-              : m_BakedCmdBufferInfo[m_LastCmdBufferID].state.compute.descSets;
+          m_BakedCmdBufferInfo[m_LastCmdBufferID].state.GetPipeline(pipelineBindPoint).descSets;
 
       // expand as necessary
       if(descsets.size() < set + 1)
@@ -5723,18 +5764,14 @@ bool WrappedVulkan::Serialise_vkCmdPushDescriptorSetWithTemplateKHR(
 
         {
           VulkanRenderState &renderstate = GetCmdRenderState();
-          rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descsets =
-              (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) ? renderstate.graphics.descSets
-                                                             : renderstate.compute.descSets;
+          VulkanStatePipeline &pipeline = renderstate.GetPipeline(bindPoint);
+          rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descsets = pipeline.descSets;
 
           // expand as necessary
           if(descsets.size() < set + 1)
             descsets.resize(set + 1);
 
-          if(bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
-            renderstate.graphics.lastBoundSet = set;
-          else
-            renderstate.compute.lastBoundSet = set;
+          pipeline.lastBoundSet = set;
 
           descsets[set].pipeLayout = GetResID(layout);
           descsets[set].descSet = setId;
@@ -5751,10 +5788,7 @@ bool WrappedVulkan::Serialise_vkCmdPushDescriptorSetWithTemplateKHR(
     {
       // track while reading, as we need to track resource usage
       rdcarray<VulkanStatePipeline::DescriptorAndOffsets> &descsets =
-          (m_CreationInfo.m_DescUpdateTemplate[GetResID(descriptorUpdateTemplate)].bindPoint ==
-           VK_PIPELINE_BIND_POINT_GRAPHICS)
-              ? m_BakedCmdBufferInfo[m_LastCmdBufferID].state.graphics.descSets
-              : m_BakedCmdBufferInfo[m_LastCmdBufferID].state.compute.descSets;
+          m_BakedCmdBufferInfo[m_LastCmdBufferID].state.GetPipeline(bindPoint).descSets;
 
       // expand as necessary
       if(descsets.size() < set + 1)
@@ -6988,14 +7022,10 @@ bool WrappedVulkan::Serialise_vkCmdBeginRendering(SerialiserType &ser, VkCommand
         commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
 
         // only if we're partially recording do we update this state
-        if(ShouldUpdateRenderState(m_LastCmdBufferID))
+        if(ShouldUpdateRenderpassActive(m_LastCmdBufferID, true))
         {
-          if(m_Partial[Primary].partialParent == m_LastCmdBufferID)
-            m_Partial[Primary].renderPassActive = true;
-          else if(m_Partial[Secondary].partialParent == m_LastCmdBufferID)
-            m_Partial[Secondary].renderPassActive = true;
-
-          m_BakedCmdBufferInfo[m_LastCmdBufferID].renderPassOpen = true;
+          GetCommandBufferPartialSubmission(m_LastCmdBufferID)->renderPassActive =
+              m_BakedCmdBufferInfo[m_LastCmdBufferID].renderPassOpen = true;
         }
         m_BakedCmdBufferInfo[m_LastCmdBufferID].activeSubpass = 0;
 
@@ -7392,17 +7422,14 @@ bool WrappedVulkan::Serialise_vkCmdEndRendering(SerialiserType &ser, VkCommandBu
 
         bool suspending = (renderstate.dynamicRendering.flags & VK_RENDERING_SUSPENDING_BIT) != 0;
 
-        if(ShouldUpdateRenderState(m_LastCmdBufferID))
+        if(ShouldUpdateRenderpassActive(m_LastCmdBufferID, true))
         {
           m_BakedCmdBufferInfo[m_LastCmdBufferID].renderPassOpen = false;
 
           // if this rendering is just being suspended, the pass is still active
-          if(!suspending)
+          if(!suspending && IsCommandBufferPartial(m_LastCmdBufferID))
           {
-            if(m_Partial[Primary].partialParent == m_LastCmdBufferID)
-              m_Partial[Primary].renderPassActive = false;
-            else if(m_Partial[Secondary].partialParent == m_LastCmdBufferID)
-              m_Partial[Secondary].renderPassActive = false;
+            GetCommandBufferPartialSubmission(m_LastCmdBufferID)->renderPassActive = false;
           }
         }
 
@@ -7633,6 +7660,16 @@ bool WrappedVulkan::Serialise_vkCmdBuildAccelerationStructuresIndirectKHR(
     for(uint32_t i = 0; i < infoCount; ++i)
       tmpMaxPrimitiveCounts[i] = maxPrimitives[i].data();
 
+    m_LastCmdBufferID = GetResourceManager()->GetOriginalID(GetResID(commandBuffer));
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+        commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
+      else
+        return true;
+    }
+
     ObjDisp(commandBuffer)
         ->CmdBuildAccelerationStructuresIndirectKHR(Unwrap(commandBuffer), infoCount,
                                                     unwrappedInfos, pIndirectDeviceAddresses,
@@ -7689,6 +7726,9 @@ void WrappedVulkan::vkCmdBuildAccelerationStructuresIndirectKHR(
 
       GetResourceManager()->MarkResourceFrameReferenced(GetResID(geomInfo.dstAccelerationStructure),
                                                         eFrameRef_CompleteWrite);
+
+      // Add to the command buffer metadata, so we can know when it has been submitted
+      record->cmdInfo->accelerationStructures.push_back(GetRecord(geomInfo.dstAccelerationStructure));
     }
   }
 }
@@ -7732,9 +7772,20 @@ bool WrappedVulkan::Serialise_vkCmdBuildAccelerationStructuresKHR(
       unwrappedInfos[i] = *UnwrapStructAndChain(m_State, memory, &pInfos[i]);
 
     // Convert the rangeInfos back to a C-style array-of-arrays
-    rdcarray<const VkAccelerationStructureBuildRangeInfoKHR *> tmpBuildRangeInfos(nullptr, infoCount);
+    rdcarray<const VkAccelerationStructureBuildRangeInfoKHR *> tmpBuildRangeInfos;
+    tmpBuildRangeInfos.resize(infoCount);
     for(uint32_t i = 0; i < infoCount; ++i)
       tmpBuildRangeInfos[i] = rangeInfos[i].data();
+
+    m_LastCmdBufferID = GetResourceManager()->GetOriginalID(GetResID(commandBuffer));
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+        commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
+      else
+        return true;
+    }
 
     ObjDisp(commandBuffer)
         ->CmdBuildAccelerationStructuresKHR(Unwrap(commandBuffer), infoCount, unwrappedInfos,
@@ -7788,30 +7839,11 @@ void WrappedVulkan::vkCmdBuildAccelerationStructuresKHR(
 
       GetResourceManager()->MarkResourceFrameReferenced(GetResID(geomInfo.dstAccelerationStructure),
                                                         eFrameRef_CompleteWrite);
+
+      // Add to the command buffer metadata, so we can know when it has been submitted
+      record->cmdInfo->accelerationStructures.push_back(GetRecord(geomInfo.dstAccelerationStructure));
     }
   }
-}
-
-// CPU-side VK_KHR_acceleration_structure calls are not supported for now
-VkResult WrappedVulkan::vkCopyAccelerationStructureKHR(VkDevice device,
-                                                       VkDeferredOperationKHR deferredOperation,
-                                                       const VkCopyAccelerationStructureInfoKHR *pInfo)
-{
-  return VK_ERROR_UNKNOWN;
-}
-
-VkResult WrappedVulkan::vkCopyAccelerationStructureToMemoryKHR(
-    VkDevice device, VkDeferredOperationKHR deferredOperation,
-    const VkCopyAccelerationStructureToMemoryInfoKHR *pInfo)
-{
-  return VK_ERROR_UNKNOWN;
-}
-
-VkResult WrappedVulkan::vkCopyMemoryToAccelerationStructureKHR(
-    VkDevice device, VkDeferredOperationKHR deferredOperation,
-    const VkCopyMemoryToAccelerationStructureInfoKHR *pInfo)
-{
-  return VK_ERROR_UNKNOWN;
 }
 
 template <typename SerialiserType>
@@ -7858,6 +7890,9 @@ void WrappedVulkan::vkCmdCopyAccelerationStructureKHR(VkCommandBuffer commandBuf
 
     GetResourceManager()->MarkResourceFrameReferenced(GetResID(pInfo->src), eFrameRef_Read);
     GetResourceManager()->MarkResourceFrameReferenced(GetResID(pInfo->dst), eFrameRef_CompleteWrite);
+
+    // Add to the command buffer metadata, so we can know when it has been submitted
+    record->cmdInfo->accelerationStructures.push_back(GetRecord(pInfo->dst));
   }
 }
 
@@ -7961,6 +7996,147 @@ VkResult WrappedVulkan::vkWriteAccelerationStructuresPropertiesKHR(
 
   return ObjDisp(device)->WriteAccelerationStructuresPropertiesKHR(
       Unwrap(device), accelerationStructureCount, unwrappedASes, queryType, dataSize, pData, stride);
+}
+
+// CPU-side VK_KHR_acceleration_structure calls are not supported for now
+VkResult WrappedVulkan::vkCopyAccelerationStructureKHR(VkDevice device,
+                                                       VkDeferredOperationKHR deferredOperation,
+                                                       const VkCopyAccelerationStructureInfoKHR *pInfo)
+{
+  return VK_ERROR_UNKNOWN;
+}
+
+VkResult WrappedVulkan::vkCopyAccelerationStructureToMemoryKHR(
+    VkDevice device, VkDeferredOperationKHR deferredOperation,
+    const VkCopyAccelerationStructureToMemoryInfoKHR *pInfo)
+{
+  return VK_ERROR_UNKNOWN;
+}
+
+VkResult WrappedVulkan::vkCopyMemoryToAccelerationStructureKHR(
+    VkDevice device, VkDeferredOperationKHR deferredOperation,
+    const VkCopyMemoryToAccelerationStructureInfoKHR *pInfo)
+{
+  return VK_ERROR_UNKNOWN;
+}
+
+template <typename SerialiserType>
+bool WrappedVulkan::Serialise_vkCmdBindShadersEXT(SerialiserType &ser,
+                                                  VkCommandBuffer commandBuffer, uint32_t stageCount,
+                                                  const VkShaderStageFlagBits *pStages,
+                                                  const VkShaderEXT *pShaders)
+{
+  SERIALISE_ELEMENT(commandBuffer);
+  SERIALISE_ELEMENT(stageCount);
+  SERIALISE_ELEMENT_ARRAY(pStages, stageCount);
+  SERIALISE_ELEMENT_ARRAY(pShaders, stageCount).Important();
+
+  Serialise_DebugMessages(ser);
+
+  SERIALISE_CHECK_READ_ERRORS();
+
+  if(IsReplayingAndReading())
+  {
+    m_LastCmdBufferID = GetResourceManager()->GetOriginalID(GetResID(commandBuffer));
+
+    if(IsActiveReplaying(m_State))
+    {
+      if(InRerecordRange(m_LastCmdBufferID))
+      {
+        commandBuffer = RerecordCmdBuf(m_LastCmdBufferID);
+
+        {
+          VulkanRenderState &renderstate = GetCmdRenderState();
+
+          for(uint32_t i = 0; i < stageCount; i++)
+          {
+            int stageIndex = StageIndex(pStages[i]);
+
+            renderstate.shaderObjects[stageIndex] =
+                pShaders && (pShaders[i] != VK_NULL_HANDLE) ? GetResID(pShaders[i]) : ResourceId();
+
+            // calling vkCmdBindShadersEXT disturbs the corresponding pipeline bind points
+            // such that any pipelines previously bound to those points are no longer bound
+            if(stageIndex == (int)ShaderStage::Compute)
+            {
+              renderstate.compute.shaderObject = true;
+              renderstate.compute.pipeline = ResourceId();
+            }
+            else
+            {
+              renderstate.graphics.shaderObject = true;
+              renderstate.graphics.pipeline = ResourceId();
+            }
+          }
+        }
+      }
+      else
+      {
+        commandBuffer = VK_NULL_HANDLE;
+      }
+    }
+    else
+    {
+      // track while reading since Serialise_vkCmdBindPipeline does as well
+      for(uint32_t i = 0; i < stageCount; i++)
+      {
+        int stageIndex = StageIndex(pStages[i]);
+
+        m_BakedCmdBufferInfo[m_LastCmdBufferID].state.shaderObjects[stageIndex] =
+            pShaders && (pShaders[i] != VK_NULL_HANDLE) ? GetResID(pShaders[i]) : ResourceId();
+
+        if(stageIndex == (int)ShaderStage::Compute)
+        {
+          m_BakedCmdBufferInfo[m_LastCmdBufferID].state.compute.pipeline = ResourceId();
+          m_BakedCmdBufferInfo[m_LastCmdBufferID].state.compute.shaderObject = true;
+        }
+        else
+        {
+          m_BakedCmdBufferInfo[m_LastCmdBufferID].state.graphics.pipeline = ResourceId();
+          m_BakedCmdBufferInfo[m_LastCmdBufferID].state.graphics.shaderObject = true;
+        }
+      }
+    }
+
+    if(commandBuffer != VK_NULL_HANDLE)
+      ObjDisp(commandBuffer)
+          ->CmdBindShadersEXT(Unwrap(commandBuffer), stageCount, pStages,
+                              UnwrapArray(pShaders, stageCount));
+  }
+
+  return true;
+}
+
+void WrappedVulkan::vkCmdBindShadersEXT(VkCommandBuffer commandBuffer, uint32_t stageCount,
+                                        const VkShaderStageFlagBits *pStages,
+                                        const VkShaderEXT *pShaders)
+{
+  SCOPED_DBG_SINK();
+
+  SERIALISE_TIME_CALL(ObjDisp(commandBuffer)
+                          ->CmdBindShadersEXT(Unwrap(commandBuffer), stageCount, pStages,
+                                              UnwrapArray(pShaders, stageCount)));
+
+  if(IsCaptureMode(m_State))
+  {
+    VkResourceRecord *record = GetRecord(commandBuffer);
+
+    CACHE_THREAD_SERIALISER();
+
+    SCOPED_SERIALISE_CHUNK(VulkanChunk::vkCmdBindShadersEXT);
+    Serialise_vkCmdBindShadersEXT(ser, commandBuffer, stageCount, pStages, pShaders);
+
+    record->AddChunk(scope.Get(&record->cmdInfo->alloc));
+    if(pShaders)
+    {
+      for(uint32_t i = 0; i < stageCount; i++)
+      {
+        // binding NULL is legal
+        if(pShaders[i] != VK_NULL_HANDLE)
+          record->MarkResourceFrameReferenced(GetResID(pShaders[i]), eFrameRef_Read);
+      }
+    }
+  }
 }
 
 INSTANTIATE_FUNCTION_SERIALISED(VkResult, vkCreateCommandPool, VkDevice device,
@@ -8146,3 +8322,7 @@ INSTANTIATE_FUNCTION_SERIALISED(void, vkCmdCopyAccelerationStructureToMemoryKHR,
 INSTANTIATE_FUNCTION_SERIALISED(void, vkCmdCopyMemoryToAccelerationStructureKHR,
                                 VkCommandBuffer commandBuffer,
                                 const VkCopyMemoryToAccelerationStructureInfoKHR *pInfo)
+
+INSTANTIATE_FUNCTION_SERIALISED(void, vkCmdBindShadersEXT, VkCommandBuffer commandBuffer,
+                                uint32_t stageCount, const VkShaderStageFlagBits *pStages,
+                                const VkShaderEXT *pShaders);

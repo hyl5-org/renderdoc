@@ -83,6 +83,14 @@ enum class ResourceKind
   SamplerComparison,
 };
 
+enum class SamplerKind
+{
+  Default = 0,
+  Comparison,
+  Mono,
+  Invalid,
+};
+
 enum class ShaderEntryTag
 {
   ShaderFlags = 0,
@@ -124,6 +132,21 @@ enum class ResField
   SamplerTags = 7,
 };
 
+enum class MatrixOrientation
+{
+  Undefined = 0,
+  RowMajor,
+  ColumnMajor,
+  LastEntry
+};
+
+enum class SamplerFeedbackType : uint8_t
+{
+  MinMip = 0,
+  MipRegionUsed = 1,
+  LastEntry = 2
+};
 };    // namespace DXIL
 
 DECLARE_STRINGISE_TYPE(DXIL::ComponentType);
+DECLARE_STRINGISE_TYPE(DXIL::ResourceClass);

@@ -386,6 +386,19 @@ HRESULT WrappedID3D12GraphicsCommandList::ResetInternal(ID3D12CommandAllocator *
     m_ListRecord->DeleteChunks();
     m_ListRecord->ContainsExecuteIndirect = false;
 
+    // release the 'persistent' reference on all these buffers immediately. If this list was never
+    // submitted, this immediately frees the buffer. If it was submitted those submissions will be
+    // holding references until their fences are appropriately signalled.
+    for(PatchedRayDispatch::Resources &r : m_RayDispatches)
+    {
+      SAFE_RELEASE(r.lookupBuffer);
+      SAFE_RELEASE(r.patchScratchBuffer);
+      SAFE_RELEASE(r.argumentBuffer);
+    }
+    m_RayDispatches.clear();
+
+    m_CaptureComputeState.m_ResourceManager = GetResourceManager();
+
     // free any baked commands.
     if(m_ListRecord->bakedCommands)
       m_ListRecord->bakedCommands->Delete(GetResourceManager());
@@ -404,8 +417,8 @@ HRESULT WrappedID3D12GraphicsCommandList::ResetInternal(ID3D12CommandAllocator *
     m_ListRecord->bakedCommands->InternalResource = true;
     m_ListRecord->bakedCommands->cmdInfo = new CmdListRecordingInfo();
 
-    m_ListRecord->cmdInfo->alloc = ((WrappedID3D12CommandAllocator *)pAllocator)->alloc;
     m_ListRecord->cmdInfo->allocRecord = GetRecord(pAllocator);
+    m_ListRecord->cmdInfo->alloc = m_ListRecord->cmdInfo->allocRecord->cmdInfo->alloc;
 
     {
       CACHE_THREAD_SERIALISER();
@@ -1048,6 +1061,10 @@ void WrappedID3D12GraphicsCommandList::SetDescriptorHeaps(UINT NumDescriptorHeap
     m_ListRecord->AddChunk(scope.Get(m_ListRecord->cmdInfo->alloc));
     for(UINT i = 0; i < NumDescriptorHeaps; i++)
       m_ListRecord->MarkResourceFrameReferenced(GetResID(ppDescriptorHeaps[i]), eFrameRef_Read);
+
+    m_CaptureComputeState.heaps.resize(NumDescriptorHeaps);
+    for(size_t i = 0; i < m_CaptureComputeState.heaps.size(); i++)
+      m_CaptureComputeState.heaps[i] = GetResID(ppDescriptorHeaps[i]);
   }
 }
 
@@ -1329,6 +1346,7 @@ bool WrappedID3D12GraphicsCommandList::Serialise_SetPipelineState(SerialiserType
     {
       D3D12RenderState &state = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID].state;
       state.pipe = GetResID(pPipelineState);
+      state.stateobj = ResourceId();
 
       if(pPipelineState)
       {
@@ -1650,6 +1668,17 @@ void WrappedID3D12GraphicsCommandList::SetComputeRootSignature(ID3D12RootSignatu
 
     // store this so we can look up how many descriptors a given slot references, etc
     m_CurCompRootSig = GetWrapped(pRootSignature);
+
+    // From the docs
+    // (https://microsoft.github.io/DirectX-Specs/d3d/ResourceBinding.html#command-list-semantics)
+    // "If a root signature is changed on a command list, all previous root arguments become stale
+    // and all newly expected arguments must be set before Draw/Dispatch otherwise behavior is
+    // undefined. If the root signature is redundantly set to the same one currently set, existing
+    // root signature bindings do not become stale."
+    if(Unwrap(GetResourceManager()->GetCurrentAs<ID3D12RootSignature>(
+           m_CaptureComputeState.compute.rootsig)) != Unwrap(pRootSignature))
+      m_CaptureComputeState.compute.sigelems.clear();
+    m_CaptureComputeState.compute.rootsig = GetResID(pRootSignature);
   }
 }
 
@@ -1720,6 +1749,14 @@ void WrappedID3D12GraphicsCommandList::SetComputeRootDescriptorTable(
     m_ListRecord->AddChunk(scope.Get(m_ListRecord->cmdInfo->alloc));
     m_ListRecord->MarkResourceFrameReferenced(GetWrapped(BaseDescriptor)->GetHeapResourceId(),
                                               eFrameRef_Read);
+
+    {
+      m_CaptureComputeState.compute.sigelems.resize_for_index(RootParameterIndex);
+      m_CaptureComputeState.compute.sigelems[RootParameterIndex] =
+          D3D12RenderState::SignatureElement(eRootTable,
+                                             GetWrapped(BaseDescriptor)->GetHeapResourceId(),
+                                             (UINT64)GetWrapped(BaseDescriptor)->GetHeapIndex());
+    }
 
     rdcarray<D3D12_DESCRIPTOR_RANGE1> &ranges =
         GetWrapped(m_CurCompRootSig)->sig.Parameters[RootParameterIndex].ranges;
@@ -1825,6 +1862,12 @@ void WrappedID3D12GraphicsCommandList::SetComputeRoot32BitConstant(UINT RootPara
     Serialise_SetComputeRoot32BitConstant(ser, RootParameterIndex, SrcData, DestOffsetIn32BitValues);
 
     m_ListRecord->AddChunk(scope.Get(m_ListRecord->cmdInfo->alloc));
+
+    {
+      m_CaptureComputeState.compute.sigelems.resize_for_index(RootParameterIndex);
+      m_CaptureComputeState.compute.sigelems[RootParameterIndex].SetConstant(
+          DestOffsetIn32BitValues, SrcData);
+    }
   }
 }
 
@@ -1908,6 +1951,12 @@ void WrappedID3D12GraphicsCommandList::SetComputeRoot32BitConstants(UINT RootPar
                                            DestOffsetIn32BitValues);
 
     m_ListRecord->AddChunk(scope.Get(m_ListRecord->cmdInfo->alloc));
+
+    {
+      m_CaptureComputeState.compute.sigelems.resize_for_index(RootParameterIndex);
+      m_CaptureComputeState.compute.sigelems[RootParameterIndex].SetConstants(
+          Num32BitValuesToSet, pValidSrcData, DestOffsetIn32BitValues);
+    }
   }
 }
 
@@ -1987,6 +2036,12 @@ void WrappedID3D12GraphicsCommandList::SetComputeRootConstantBufferView(
 
     m_ListRecord->AddChunk(scope.Get(m_ListRecord->cmdInfo->alloc));
     m_ListRecord->MarkResourceFrameReferenced(id, eFrameRef_Read);
+
+    {
+      m_CaptureComputeState.compute.sigelems.resize_for_index(RootParameterIndex);
+      m_CaptureComputeState.compute.sigelems[RootParameterIndex] =
+          D3D12RenderState::SignatureElement(eRootCBV, id, offs);
+    }
   }
 }
 
@@ -2066,6 +2121,12 @@ void WrappedID3D12GraphicsCommandList::SetComputeRootShaderResourceView(
 
     m_ListRecord->AddChunk(scope.Get(m_ListRecord->cmdInfo->alloc));
     m_ListRecord->MarkResourceFrameReferenced(id, eFrameRef_Read);
+
+    {
+      m_CaptureComputeState.compute.sigelems.resize_for_index(RootParameterIndex);
+      m_CaptureComputeState.compute.sigelems[RootParameterIndex] =
+          D3D12RenderState::SignatureElement(eRootSRV, id, offs);
+    }
   }
 }
 
@@ -2145,6 +2206,12 @@ void WrappedID3D12GraphicsCommandList::SetComputeRootUnorderedAccessView(
 
     m_ListRecord->AddChunk(scope.Get(m_ListRecord->cmdInfo->alloc));
     m_ListRecord->MarkResourceFrameReferenced(id, eFrameRef_Read);
+
+    {
+      m_CaptureComputeState.compute.sigelems.resize_for_index(RootParameterIndex);
+      m_CaptureComputeState.compute.sigelems[RootParameterIndex] =
+          D3D12RenderState::SignatureElement(eRootUAV, id, offs);
+    }
   }
 }
 
@@ -3791,6 +3858,37 @@ void WrappedID3D12GraphicsCommandList::FinaliseExecuteIndirectEvents(BakedCmdLis
 
             break;
           }
+          case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS:
+          {
+            D3D12_DISPATCH_RAYS_DESC *args = (D3D12_DISPATCH_RAYS_DESC *)data;
+            data += sizeof(D3D12_DISPATCH_RAYS_DESC);
+
+            curAction.dispatchDimension[0] = args->Width;
+            curAction.dispatchDimension[1] = args->Height;
+            curAction.dispatchDimension[2] = args->Depth;
+            curAction.flags |= ActionFlags::DispatchRay | ActionFlags::Indirect;
+            curAction.customName =
+                StringFormat::Fmt("[%u] arg%u: IndirectDispatchRays(<%u, %u, %u>)", i, a,
+                                  curAction.dispatchDimension[0], curAction.dispatchDimension[1],
+                                  curAction.dispatchDimension[2]);
+
+            fakeChunk->name = curAction.customName;
+
+            structuriser.Serialise("ArgumentData"_lit, *args).Important();
+
+            // if this is the first action of the indirect, we could have picked up previous
+            // non-indirect events in this action, so the EID will be higher than we expect. Just
+            // assign the action's EID
+            eid = curAction.eventId;
+
+            m_Cmd->AddUsage(state, actions[idx]);
+
+            // advance
+            idx++;
+            eid++;
+
+            break;
+          }
           case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
           {
             size_t argSize = sizeof(uint32_t) * arg.Constant.Num32BitValuesToSet;
@@ -3978,6 +4076,8 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
 
     BakedCmdListInfo &cmdInfo = m_Cmd->m_BakedCmdListInfo[m_Cmd->m_LastCmdListID];
 
+    const D3D12RenderState &state = cmdInfo.state;
+
     if(IsActiveReplaying(m_State))
     {
       WrappedID3D12CommandSignature *comSig = (WrappedID3D12CommandSignature *)pCommandSignature;
@@ -4042,6 +4142,11 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
         // when we have a callback, submit every action individually to the callback
         if(m_Cmd->m_ActionCallback)
         {
+          if(m_Cmd->m_FirstEventID <= 1)
+            count = RDCMIN(count, executesReplayed);
+          else
+            count = 1;
+
           D3D12MarkerRegion::Begin(
               list, StringFormat::Fmt("ExecuteIndirect callback replay (drawCount=%u)", count));
 
@@ -4056,19 +4161,33 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
             m_Cmd->m_IndirectData.commandSig = pCommandSignature;
             m_Cmd->m_IndirectData.argsBuffer = patched.first;
             m_Cmd->m_IndirectData.argsOffset = patched.second;
+            ActionFlags drawType =
+                comSig->sig.graphics ? ActionFlags::Drawcall : ActionFlags::Dispatch;
 
-            uint32_t eventId = m_Cmd->HandlePreCallback(list, ActionFlags::Drawcall,
-                                                        (i + 1) * comSig->sig.arguments.count());
+            uint32_t eventId =
+                m_Cmd->HandlePreCallback(list, drawType, (i + 1) * comSig->sig.arguments.count());
 
             // action up to and including i. The previous draws will be nop'd out
             Unwrap(list)->ExecuteIndirect(Unwrap(pCommandSignature), 1, Unwrap(patched.first),
                                           patched.second, NULL, 0);
 
-            if(eventId && m_Cmd->m_ActionCallback->PostDraw(eventId, list))
+            if(drawType == ActionFlags::Drawcall)
             {
-              Unwrap(list)->ExecuteIndirect(Unwrap(pCommandSignature), 1, Unwrap(patched.first),
-                                            patched.second, NULL, 0);
-              m_Cmd->m_ActionCallback->PostRedraw(eventId, list);
+              if(eventId && m_Cmd->m_ActionCallback->PostDraw(eventId, list))
+              {
+                Unwrap(list)->ExecuteIndirect(Unwrap(pCommandSignature), 1, Unwrap(patched.first),
+                                              patched.second, NULL, 0);
+                m_Cmd->m_ActionCallback->PostRedraw(eventId, list);
+              }
+            }
+            else
+            {
+              if(eventId && m_Cmd->m_ActionCallback->PostDispatch(eventId, list))
+              {
+                Unwrap(list)->ExecuteIndirect(Unwrap(pCommandSignature), 1, Unwrap(patched.first),
+                                              patched.second, NULL, 0);
+                m_Cmd->m_ActionCallback->PostRedispatch(eventId, list);
+              }
             }
 
             m_Cmd->m_IndirectData.commandSig = NULL;
@@ -4088,6 +4207,31 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
                   pArgumentBuffer, ArgumentBufferOffset,
                   (pCountBuffer ? pCountBuffer->GetGPUVirtualAddress() : 0) + CountBufferOffset,
                   MaxCommandCount);
+
+          ID3D12Resource *argBuffer = Unwrap(patched.first);
+          UINT64 argOffset = patched.second;
+
+          if(comSig->sig.raytraced)
+          {
+            PatchedRayDispatch patchedDispatch = {};
+            patchedDispatch =
+                GetResourceManager()->GetRaytracingResourceAndUtilHandler()->PatchIndirectRayDispatch(
+                    Unwrap(pCommandList), state.heaps, comSig, MaxCommandCount, patched.first,
+                    patched.second, pCountBuffer, CountBufferOffset);
+
+            argBuffer = patchedDispatch.resources.argumentBuffer->Resource();
+            argOffset = patchedDispatch.resources.argumentBuffer->Offset();
+
+            // restore state that would have been mutated by the patching process
+            Unwrap(pCommandList)
+                ->SetComputeRootSignature(Unwrap(
+                    GetResourceManager()->GetCurrentAs<ID3D12RootSignature>(state.compute.rootsig)));
+            Unwrap4((ID3D12GraphicsCommandList4 *)pCommandList)
+                ->SetPipelineState1(
+                    Unwrap(GetResourceManager()->GetCurrentAs<ID3D12StateObject>(state.stateobj)));
+            state.ApplyComputeRootElementsUnwrapped(Unwrap(pCommandList));
+            m_Cmd->m_RayDispatches.push_back(patchedDispatch.resources);
+          }
 
           if(m_Cmd->m_FirstEventID <= 1)
           {
@@ -4122,13 +4266,13 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
               // fortunately ExecuteIndirect has no 'draw' builtin, so we can just offset the
               // argument buffer and set count to 1
               count = 1;
-              patched.second += comSig->sig.ByteStride * execidx;
+              argOffset += comSig->sig.ByteStride * execidx;
             }
           }
 
           if(count > 0)
-            Unwrap(list)->ExecuteIndirect(Unwrap(pCommandSignature), count, Unwrap(patched.first),
-                                          patched.second, NULL, 0);
+            Unwrap(list)->ExecuteIndirect(Unwrap(pCommandSignature), count, argBuffer, argOffset,
+                                          NULL, 0);
         }
       }
 
@@ -4165,8 +4309,33 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
           (pCountBuffer ? pCountBuffer->GetGPUVirtualAddress() : 0) + CountBufferOffset,
           MaxCommandCount);
 
-      Unwrap(list)->ExecuteIndirect(comSig->GetReal(), MaxCommandCount, Unwrap(patched.first),
-                                    patched.second, Unwrap(pCountBuffer), CountBufferOffset);
+      ID3D12Resource *argBuffer = Unwrap(patched.first);
+      UINT64 argOffset = patched.second;
+
+      if(comSig->sig.raytraced)
+      {
+        PatchedRayDispatch patchedDispatch = {};
+        patchedDispatch =
+            GetResourceManager()->GetRaytracingResourceAndUtilHandler()->PatchIndirectRayDispatch(
+                Unwrap(list), state.heaps, comSig, MaxCommandCount, patched.first, patched.second,
+                pCountBuffer, CountBufferOffset);
+
+        argBuffer = patchedDispatch.resources.argumentBuffer->Resource();
+        argOffset = patchedDispatch.resources.argumentBuffer->Offset();
+
+        // restore state that would have been mutated by the patching process
+        Unwrap(pCommandList)
+            ->SetComputeRootSignature(Unwrap(
+                GetResourceManager()->GetCurrentAs<ID3D12RootSignature>(state.compute.rootsig)));
+        Unwrap4((ID3D12GraphicsCommandList4 *)pCommandList)
+            ->SetPipelineState1(
+                Unwrap(GetResourceManager()->GetCurrentAs<ID3D12StateObject>(state.stateobj)));
+        state.ApplyComputeRootElementsUnwrapped(Unwrap(pCommandList));
+        m_Cmd->m_RayDispatches.push_back(patchedDispatch.resources);
+      }
+
+      Unwrap(list)->ExecuteIndirect(comSig->GetReal(), MaxCommandCount, argBuffer, argOffset,
+                                    Unwrap(pCountBuffer), CountBufferOffset);
 
       const uint32_t sigSize = (uint32_t)comSig->sig.arguments.size();
 
@@ -4202,6 +4371,7 @@ bool WrappedID3D12GraphicsCommandList::Serialise_ExecuteIndirect(
           {
             case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
             case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS:
             case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
             case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
             {
@@ -4250,9 +4420,30 @@ void WrappedID3D12GraphicsCommandList::ExecuteIndirect(ID3D12CommandSignature *p
                                                        ID3D12Resource *pCountBuffer,
                                                        UINT64 CountBufferOffset)
 {
-  SERIALISE_TIME_CALL(m_pList->ExecuteIndirect(Unwrap(pCommandSignature), MaxCommandCount,
-                                               Unwrap(pArgumentBuffer), ArgumentBufferOffset,
-                                               Unwrap(pCountBuffer), CountBufferOffset));
+  ID3D12Resource *argBuffer = Unwrap(pArgumentBuffer);
+  UINT64 argOffset = ArgumentBufferOffset;
+
+  PatchedRayDispatch patchedDispatch = {};
+  if(((WrappedID3D12CommandSignature *)pCommandSignature)->sig.raytraced)
+  {
+    patchedDispatch =
+        GetResourceManager()->GetRaytracingResourceAndUtilHandler()->PatchIndirectRayDispatch(
+            m_pList, m_CaptureComputeState.heaps, pCommandSignature, MaxCommandCount,
+            pArgumentBuffer, ArgumentBufferOffset, pCountBuffer, CountBufferOffset);
+
+    argBuffer = patchedDispatch.resources.argumentBuffer->Resource();
+    argOffset = patchedDispatch.resources.argumentBuffer->Offset();
+
+    // restore state that would have been mutated by the patching process
+    m_pList->SetComputeRootSignature(Unwrap(GetResourceManager()->GetCurrentAs<ID3D12RootSignature>(
+        m_CaptureComputeState.compute.rootsig)));
+    m_pList4->SetPipelineState1(Unwrap(
+        GetResourceManager()->GetCurrentAs<ID3D12StateObject>(m_CaptureComputeState.stateobj)));
+    m_CaptureComputeState.ApplyComputeRootElementsUnwrapped(m_pList);
+  }
+
+  SERIALISE_TIME_CALL(m_pList->ExecuteIndirect(Unwrap(pCommandSignature), MaxCommandCount, argBuffer,
+                                               argOffset, Unwrap(pCountBuffer), CountBufferOffset));
   if(IsCaptureMode(m_State))
   {
     CACHE_THREAD_SERIALISER();
@@ -4268,6 +4459,13 @@ void WrappedID3D12GraphicsCommandList::ExecuteIndirect(ID3D12CommandSignature *p
     m_ListRecord->MarkResourceFrameReferenced(GetResID(pCommandSignature), eFrameRef_Read);
     m_ListRecord->MarkResourceFrameReferenced(GetResID(pArgumentBuffer), eFrameRef_Read);
     m_ListRecord->MarkResourceFrameReferenced(GetResID(pCountBuffer), eFrameRef_Read);
+
+    // during capture track the ray dispatches so the memory can be freed dynamically. On replay we
+    if(patchedDispatch.resources.lookupBuffer)
+    {
+      // free all the memory at the end of each replay
+      m_RayDispatches.push_back(patchedDispatch.resources);
+    }
   }
 }
 

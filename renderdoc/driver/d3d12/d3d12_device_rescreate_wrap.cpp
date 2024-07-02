@@ -248,7 +248,7 @@ bool WrappedID3D12Device::Serialise_CreateResource(
   SetObjName(ret, StringFormat::Fmt("%s Resource %s %s", ResourceTypeName,
                                     ToStr(desc.Dimension).c_str(), ToStr(pResource).c_str()));
 
-  ret = new WrappedID3D12Resource(ret, pHeap, HeapOffset, this);
+  ret = new WrappedID3D12Resource(ret, pHeap, HeapOffset, this, gpuAddress);
 
   switch(chunkType)
   {
@@ -276,7 +276,7 @@ bool WrappedID3D12Device::Serialise_CreateResource(
     type = ResourceType::Buffer;
     if(InitialLayout.ToStates() == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)
     {
-      prefix = "Acceleration Structure";
+      prefix = "AS Buffer";
       ((WrappedID3D12Resource *)ret)->MarkAsAccelerationStructureResource();
     }
     else

@@ -3272,6 +3272,82 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
           RDCWARN("meshShaderQueries = false, mesh shader performance counters unavailable");
       }
       END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceAccelerationStructureFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(accelerationStructure)
+        CHECK_PHYS_EXT_FEATURE(accelerationStructureCaptureReplay)
+        CHECK_PHYS_EXT_FEATURE(accelerationStructureIndirectBuild)
+        CHECK_PHYS_EXT_FEATURE(descriptorBindingAccelerationStructureUpdateAfterBind)
+
+        if(ext->accelerationStructure && !avail.accelerationStructureCaptureReplay)
+        {
+          SET_ERROR_RESULT(
+              m_FailedReplayResult, ResultCode::APIHardwareUnsupported,
+              "Capture requires accelerationStructure support, which is available, but "
+              "accelerationStructureCaptureReplay support is not available which is required to "
+              "replay\n"
+              "\n%s",
+              GetPhysDeviceCompatString(false, false).c_str());
+          return false;
+        }
+
+        m_AccelerationStructures = ext->accelerationStructure != VK_FALSE;
+        if(m_AccelerationStructures)
+        {
+          RDCLOG(
+              "Ray tracing acceleration structures requested, allocating all device memory with "
+              "VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT");
+          ext->accelerationStructureCaptureReplay = VK_TRUE;
+        }
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceNestedCommandBufferFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NESTED_COMMAND_BUFFER_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(nestedCommandBuffer);
+        CHECK_PHYS_EXT_FEATURE(nestedCommandBufferRendering);
+        CHECK_PHYS_EXT_FEATURE(nestedCommandBufferSimultaneousUse);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceShaderObjectFeaturesEXT,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderObject);
+
+        m_ShaderObject = ext->shaderObject != VK_FALSE;
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(
+          VkPhysicalDeviceShaderRelaxedExtendedInstructionFeaturesKHR,
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_RELAXED_EXTENDED_INSTRUCTION_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(shaderRelaxedExtendedInstruction);
+      }
+      END_PHYS_EXT_CHECK();
+
+      BEGIN_PHYS_EXT_CHECK(VkPhysicalDeviceRayTracingPipelineFeaturesKHR,
+                           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR);
+      {
+        CHECK_PHYS_EXT_FEATURE(rayTracingPipeline);
+        CHECK_PHYS_EXT_FEATURE(rayTracingPipelineShaderGroupHandleCaptureReplay);
+        CHECK_PHYS_EXT_FEATURE(rayTracingPipelineShaderGroupHandleCaptureReplayMixed);
+        CHECK_PHYS_EXT_FEATURE(rayTracingPipelineTraceRaysIndirect);
+        CHECK_PHYS_EXT_FEATURE(rayTraversalPrimitiveCulling);
+
+        VkPhysicalDeviceRayTracingPipelinePropertiesKHR rayProps = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR,
+        };
+
+        VkPhysicalDeviceProperties2 availPropsBase = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        availPropsBase.pNext = &rayProps;
+        ObjDisp(physicalDevice)->GetPhysicalDeviceProperties2(Unwrap(physicalDevice), &availPropsBase);
+      }
+      END_PHYS_EXT_CHECK();
     }
 
     if(availFeatures.depthClamp)
@@ -4048,6 +4124,22 @@ bool WrappedVulkan::Serialise_vkCreateDevice(SerialiserType &ser, VkPhysicalDevi
     for(size_t i = 0; i < queueProps.size(); i++)
       m_PhysicalDeviceData.queueProps[i] = queueProps[i];
 
+    if(RDCMIN(m_EnabledExtensions.vulkanVersion, physProps.apiVersion) >= VK_MAKE_VERSION(1, 1, 0))
+    {
+      VkPhysicalDeviceVulkan11Properties vulkan11Props = {
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES,
+      };
+
+      VkPhysicalDeviceProperties2 devProps2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+      devProps2.pNext = &vulkan11Props;
+      ObjDisp(physicalDevice)->GetPhysicalDeviceProperties2(Unwrap(physicalDevice), &devProps2);
+      m_PhysicalDeviceData.maxMemoryAllocationSize = vulkan11Props.maxMemoryAllocationSize;
+    }
+    else
+    {
+      m_PhysicalDeviceData.maxMemoryAllocationSize = 0x80000000U;
+    }
+
     ChooseMemoryIndices();
 
     APIProps.vendor = GetDriverInfo().Vendor();
@@ -4301,6 +4393,18 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
   if(separateDepthStencilFeatures)
     m_SeparateDepthStencil |= (separateDepthStencilFeatures->separateDepthStencilLayouts != VK_FALSE);
 
+  // we need to enable acceleration structure capture/replay. We verified that this is OK before
+  // whitelisting the extension
+
+  VkPhysicalDeviceAccelerationStructureFeaturesKHR *accFeatures =
+      (VkPhysicalDeviceAccelerationStructureFeaturesKHR *)FindNextStruct(
+          &createInfo, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR);
+  if(accFeatures && accFeatures->accelerationStructure)
+  {
+    accFeatures->accelerationStructureCaptureReplay = VK_TRUE;
+    m_AccelerationStructures = true;
+  }
+
   VkResult ret;
   SERIALISE_TIME_CALL(ret = createFunc(Unwrap(physicalDevice), &createInfo, NULL, pDevice));
 
@@ -4512,6 +4616,7 @@ VkResult WrappedVulkan::vkCreateDevice(VkPhysicalDevice physicalDevice,
       RDCLOG("Forcing 200MB soft memory limit");
     }
 
+    m_PhysicalDeviceData.maxMemoryAllocationSize = 0;
     ChooseMemoryIndices();
 
     m_PhysicalDeviceData.queueCount = (uint32_t)queueProps.size();

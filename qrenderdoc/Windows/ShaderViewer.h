@@ -129,20 +129,19 @@ public:
     return ret;
   }
 
-  static IShaderViewer *DebugShader(ICaptureContext &ctx, const ShaderBindpointMapping *bind,
-                                    const ShaderReflection *shader, ResourceId pipeline,
-                                    ShaderDebugTrace *trace, const QString &debugContext,
-                                    QWidget *parent)
+  static IShaderViewer *DebugShader(ICaptureContext &ctx, const ShaderReflection *shader,
+                                    ResourceId pipeline, ShaderDebugTrace *trace,
+                                    const QString &debugContext, QWidget *parent)
   {
     ShaderViewer *ret = new ShaderViewer(ctx, parent);
-    ret->debugShader(bind, shader, pipeline, trace, debugContext);
+    ret->debugShader(shader, pipeline, trace, debugContext);
     return ret;
   }
 
   static IShaderViewer *ViewShader(ICaptureContext &ctx, const ShaderReflection *shader,
                                    ResourceId pipeline, QWidget *parent)
   {
-    return DebugShader(ctx, NULL, shader, pipeline, NULL, QString(), parent);
+    return DebugShader(ctx, shader, pipeline, NULL, QString(), parent);
   }
 
   ~ShaderViewer();
@@ -210,14 +209,18 @@ private:
   void editShader(ResourceId id, ShaderStage stage, const QString &entryPoint,
                   const rdcstrpairs &files, KnownShaderTool knownTool,
                   ShaderEncoding shaderEncoding, ShaderCompileFlags flags);
-  void debugShader(const ShaderBindpointMapping *bind, const ShaderReflection *shader,
-                   ResourceId pipeline, ShaderDebugTrace *trace, const QString &debugContext);
+  void debugShader(const ShaderReflection *shader, ResourceId pipeline, ShaderDebugTrace *trace,
+                   const QString &debugContext);
 
   bool eventFilter(QObject *watched, QEvent *event) override;
 
   QAction *MakeExecuteAction(QString name, const QIcon &icon, QString tooltip, QKeySequence shortcut);
 
   void MarkModification();
+
+  void ConfigureBookmarkMenu();
+  void UpdateBookmarkMenu(QMenu *menu, QAction *nextAction, QAction *prevAction,
+                          QAction *clearAction);
 
   void PopulateCompileTools();
   void PopulateCompileToolParameters();
@@ -239,6 +242,14 @@ private:
 
   ShaderEncoding currentEncoding();
 
+  void ToggleBookmark();
+  void NextBookmark();
+  void PreviousBookmark();
+  void ClearAllBookmarks();
+  bool HasBookmarks();
+
+  void SetFindTextFromCurrentWord();
+
   QString m_TooltipVarPath;
   int m_TooltipVarIndex = -1;
   int m_TooltipMember = -1;
@@ -246,7 +257,6 @@ private:
 
   Ui::ShaderViewer *ui;
   ICaptureContext &m_Ctx;
-  ShaderBindpointMapping m_Mapping;
   const ShaderReflection *m_ShaderDetails = NULL;
   bool m_CustomShader = false;
   ResourceId m_EditingShader;
@@ -321,16 +331,21 @@ private:
   rdcarray<AccessedResourceData> m_AccessedResources;
   AccessedResourceView m_AccessedResourceView = AccessedResourceView::SortByResource;
 
-  rdcarray<BoundResourceArray> m_ReadOnlyResources;
-  rdcarray<BoundResourceArray> m_ReadWriteResources;
+  rdcarray<UsedDescriptor> m_ReadOnlyResources;
+  rdcarray<UsedDescriptor> m_ReadWriteResources;
   QSet<QPair<int, uint32_t>> m_Breakpoints;
   bool m_TempBreakpoint = false;
 
   QList<QPair<ScintillaEdit *, int>> m_FindAllResults;
 
+  static const int BOOKMARK_MAX_MENU_ENTRY_LENGTH = 40;    // max length of bookmark names in menu
+  static const int BOOKMARK_MAX_MENU_ENTRY_COUNT = 30;     // max number of bookmarks listed in menu
+  QMap<ScintillaEdit *, QList<sptr_t>> m_Bookmarks;
+
   static const int CURRENT_MARKER = 0;
   static const int BREAKPOINT_MARKER = 2;
   static const int FINISHED_MARKER = 4;
+  static const int BOOKMARK_MARKER = 6;
 
   static const int CURRENT_INDICATOR = 20;
   static const int FINISHED_INDICATOR = 21;
@@ -408,13 +423,13 @@ private:
   void runTo(const rdcarray<uint32_t> &runToInstructions, bool forward, ShaderEvents condition);
   void runTo(uint32_t runToInstruction, bool forward, ShaderEvents condition = ShaderEvents::NoEvent);
 
-  void runToResourceAccess(bool forward, VarType type, const BindpointIndex &resource);
+  void runToResourceAccess(bool forward, VarType type, const ShaderBindIndex &resource);
 
   void applyBackwardsChange();
   void applyForwardsChange();
 
   QString stringRep(const ShaderVariable &var, uint32_t row = 0);
-  QString samplerRep(Bindpoint bind, uint32_t arrayIndex, ResourceId id);
+  QString samplerRep(const ShaderSampler &samp, uint32_t arrayElement, ResourceId id);
   void combineStructures(RDTreeWidgetItem *root, int skipPrefixLength = 0);
   void highlightMatchingVars(RDTreeWidgetItem *root, const QString varName,
                              const QColor highlightColor);

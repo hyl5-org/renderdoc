@@ -76,6 +76,7 @@ enum VkResourceType
   eResDescUpdateTemplate,
   eResSamplerConversion,
   eResAccelerationStructureKHR,
+  eResShaderEXT,
 };
 
 DECLARE_REFLECTION_ENUM(VkResourceType);
@@ -573,6 +574,16 @@ struct WrappedVkAccelerationStructureKHR : WrappedVkNonDispRes
     TypeEnum = eResAccelerationStructureKHR,
   };
 };
+struct WrappedVkShaderEXT : WrappedVkNonDispRes
+{
+  WrappedVkShaderEXT(VkShaderEXT obj, ResourceId objId) : WrappedVkNonDispRes(obj, objId) {}
+  typedef VkShaderEXT InnerType;
+  ALLOCATE_WITH_WRAPPED_POOL(WrappedVkShaderEXT);
+  enum
+  {
+    TypeEnum = eResShaderEXT,
+  };
+};
 
 // VkDisplayKHR and VkDisplayModeKHR are both UNWRAPPED because there's no need to wrap them.
 // The only thing we need to wrap VkSurfaceKHR for is to get back the window from it later.
@@ -676,6 +687,7 @@ UNWRAP_NONDISP_HELPER(VkSurfaceKHR)
 UNWRAP_NONDISP_HELPER(VkDescriptorUpdateTemplate)
 UNWRAP_NONDISP_HELPER(VkSamplerYcbcrConversion)
 UNWRAP_NONDISP_HELPER(VkAccelerationStructureKHR)
+UNWRAP_NONDISP_HELPER(VkShaderEXT)
 
 // VkDisplayKHR and VkDisplayModeKHR are both UNWRAPPED because there's no need to wrap them.
 // The only thing we need to wrap VkSurfaceKHR for is to get back the window from it later.
@@ -873,6 +885,7 @@ struct ImageInfo
   uint16_t levelCount = 0;
   uint16_t sampleCount = 0;
   bool storage = false;
+  bool isAHB = false;
   VkExtent3D extent = {0, 0, 0};
   VkImageType imageType = VK_IMAGE_TYPE_2D;
   VkFormat format = VK_FORMAT_UNDEFINED;
@@ -995,6 +1008,11 @@ struct ResourceInfo
   // METADATA) we put them in the array.
   Sparse::PageTable sparseTable;
   rdcarray<AspectSparseTable> altSparseAspects;
+
+  // for external images if we query both external and non-external and the sizes are different, we
+  // can't allow dedicated memory as it is required to precisely match in size.
+  bool banDedicated = false;
+
   VkImageAspectFlags sparseAspect;
 
   ResourceId dedicatedMemory;
@@ -1105,6 +1123,9 @@ struct CmdBufferRecordingInfo
   rdcflatmap<ResourceId, ImageState> imageStates;
 
   std::unordered_map<ResourceId, MemRefs> memFrameRefs;
+
+  // A list of acceleration structures that this command buffer will build or copy
+  rdcarray<VkResourceRecord *> accelerationStructures;
 
   // AdvanceFrame/Present should be called after this buffer is submitted
   bool present;
@@ -2207,6 +2228,7 @@ public:
     RDCASSERT(bakedCommands->cmdInfo->imageStates.empty());
     cmdInfo->imageStates.swap(bakedCommands->cmdInfo->imageStates);
     cmdInfo->memFrameRefs.swap(bakedCommands->cmdInfo->memFrameRefs);
+    cmdInfo->accelerationStructures.swap(bakedCommands->cmdInfo->accelerationStructures);
   }
 
   // we have a lot of 'cold' data in the resource record, as it can be accessed
@@ -2263,6 +2285,7 @@ public:
     DescPoolInfo *descPoolInfo;              // only for descriptor pools
     CmdPoolInfo *cmdPoolInfo;                // only for command pools
     uint32_t queueFamilyIndex;               // only for queues
+    bool accelerationStructureBuilt;         // only for acceleration structures
   };
 
   VkResourceRecord *bakedCommands;
@@ -2448,8 +2471,8 @@ struct BlockShape
 BlockShape GetBlockShape(VkFormat Format, uint32_t plane);
 VkExtent2D GetPlaneShape(uint32_t Width, uint32_t Height, VkFormat Format, uint32_t plane);
 
-uint32_t GetByteSize(uint32_t Width, uint32_t Height, uint32_t Depth, VkFormat Format, uint32_t mip);
-uint32_t GetPlaneByteSize(uint32_t Width, uint32_t Height, uint32_t Depth, VkFormat Format,
+uint64_t GetByteSize(uint32_t Width, uint32_t Height, uint32_t Depth, VkFormat Format, uint32_t mip);
+uint64_t GetPlaneByteSize(uint32_t Width, uint32_t Height, uint32_t Depth, VkFormat Format,
                           uint32_t mip, uint32_t plane);
 
 template <typename T>

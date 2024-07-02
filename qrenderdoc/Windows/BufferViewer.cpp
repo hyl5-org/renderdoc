@@ -3315,11 +3315,11 @@ void BufferViewer::OnEventChanged(uint32_t eventId)
     // update with the current cbuffer for the current slot
     if(IsCBufferView())
     {
-      BoundCBuffer cb = m_Ctx.CurPipelineState().GetConstantBuffer(
+      UsedDescriptor cb = m_Ctx.CurPipelineState().GetConstantBlock(
           m_CBufferSlot.stage, m_CBufferSlot.slot, m_CBufferSlot.arrayIdx);
-      m_BufferID = cb.resourceId;
-      m_ByteOffset = cb.byteOffset;
-      m_ByteSize = cb.byteSize;
+      m_BufferID = cb.descriptor.resource;
+      m_ByteOffset = cb.descriptor.byteOffset;
+      m_ByteSize = cb.descriptor.byteSize;
 
       const ShaderReflection *reflection =
           m_Ctx.CurPipelineState().GetShaderReflection(m_CBufferSlot.stage);
@@ -3329,6 +3329,8 @@ void BufferViewer::OnEventChanged(uint32_t eventId)
       {
         bufdata->cb.bytesBacked = reflection->constantBlocks[m_CBufferSlot.slot].bufferBacked ||
                                   reflection->constantBlocks[m_CBufferSlot.slot].inlineDataBytes;
+        bufdata->cb.compileConstants =
+            reflection->constantBlocks[m_CBufferSlot.slot].compileConstants;
       }
 
       ui->setFormat->setEnabled(bufdata->cb.bytesBacked);
@@ -3342,7 +3344,6 @@ void BufferViewer::OnEventChanged(uint32_t eventId)
                              : m_Ctx.CurPipelineState().GetGraphicsPipelineObject();
       bufdata->cb.shader = m_Ctx.CurPipelineState().GetShader(m_CBufferSlot.stage);
       bufdata->cb.entryPoint = m_Ctx.CurPipelineState().GetShaderEntryPoint(m_CBufferSlot.stage);
-      bufdata->cb.inlinedata = cb.inlineData;
 
       if(m_Format.isEmpty())
       {
@@ -3589,7 +3590,7 @@ void BufferViewer::OnEventChanged(uint32_t eventId)
       {
         if(m_BufferID == ResourceId())
         {
-          buf->storage = bufdata->cb.inlinedata;
+          buf->storage.clear();
         }
         else if(repeatedRangeStart > fixedLength)
         {
@@ -3616,7 +3617,9 @@ void BufferViewer::OnEventChanged(uint32_t eventId)
           m_ObjectByteSize = buf->storage.size();
       }
 
-      uint32_t repeatedDataAvailable = uint32_t(buf->size() - fixedLength);
+      uint32_t repeatedDataAvailable = uint32_t(buf->size());
+      if(repeatedDataAvailable > fixedLength)
+        repeatedDataAvailable -= fixedLength;
 
       bufdata->inConfig.pagingOffset = uint32_t(m_PagingByteOffset / buf->stride);
       bufdata->inConfig.numRows = uint32_t((repeatedDataAvailable + buf->stride - 1) / buf->stride);
@@ -3824,7 +3827,7 @@ void BufferViewer::OnEventChanged(uint32_t eventId)
         {
           rdcarray<ShaderVariable> vars;
 
-          if((m_BufferID == ResourceId() && m_CurCBuffer.inlinedata.empty()) || m_Format.isEmpty())
+          if(m_BufferID == ResourceId() || m_Format.isEmpty())
           {
             vars = bufdata->inConfig.evalVars;
           }
@@ -4191,6 +4194,9 @@ void BufferViewer::UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOff
           QFormatStr(" (bits %1:%2)").arg(c.bitFieldOffset).arg(c.bitFieldOffset + c.bitFieldSize);
     }
 
+    if(m_CurCBuffer.compileConstants)
+      offsetStr = lit("-");
+
     RDTreeWidgetItem *n =
         new RDTreeWidgetItem({v.name, VarString(v, c), offsetStr, TypeString(v, c)});
 
@@ -4217,7 +4223,8 @@ void BufferViewer::UI_AddFixedVariables(RDTreeWidgetItem *root, uint32_t baseOff
         RDTreeWidgetItem *el = new RDTreeWidgetItem({
             v.members[e].name,
             VarString(v.members[e], c),
-            Formatter::HumanFormat(elOffset, Formatter::OffsetSize),
+            m_CurCBuffer.compileConstants ? lit("-")
+                                          : Formatter::HumanFormat(elOffset, Formatter::OffsetSize),
             TypeString(v.members[e], c),
         });
 
@@ -5382,14 +5389,14 @@ void BufferViewer::updateLabelsAndLayout()
       const ShaderReflection *reflection =
           m_Ctx.CurPipelineState().GetShaderReflection(m_CBufferSlot.stage);
 
-      int32_t bindPoint = -1;
+      uint32_t arraySize = ~0U;
       if(reflection != NULL)
       {
         if(m_CBufferSlot.slot < reflection->constantBlocks.size() &&
            !reflection->constantBlocks[m_CBufferSlot.slot].name.isEmpty())
         {
           bufName = QFormatStr("<%1>").arg(reflection->constantBlocks[m_CBufferSlot.slot].name);
-          bindPoint = reflection->constantBlocks[m_CBufferSlot.slot].bindPoint;
+          arraySize = reflection->constantBlocks[m_CBufferSlot.slot].bindArraySize;
         }
       }
 
@@ -5400,13 +5407,6 @@ void BufferViewer::updateLabelsAndLayout()
         else
           bufName = tr("Unbound");
       }
-
-      const ShaderBindpointMapping &mapping =
-          m_Ctx.CurPipelineState().GetBindpointMapping(m_CBufferSlot.stage);
-
-      uint32_t arraySize = ~0U;
-      if(bindPoint >= 0 && bindPoint < mapping.constantBlocks.count())
-        arraySize = mapping.constantBlocks[bindPoint].arraySize;
 
       GraphicsAPI pipeType = m_Ctx.APIProps().pipelineType;
 
@@ -6622,12 +6622,10 @@ void BufferViewer::debugVertex()
 
   const ShaderReflection *shaderDetails =
       m_Ctx.CurPipelineState().GetShaderReflection(ShaderStage::Vertex);
-  const ShaderBindpointMapping &bindMapping =
-      m_Ctx.CurPipelineState().GetBindpointMapping(ShaderStage::Vertex);
   ResourceId pipeline = m_Ctx.CurPipelineState().GetGraphicsPipelineObject();
 
   // viewer takes ownership of the trace
-  IShaderViewer *s = m_Ctx.DebugShader(&bindMapping, shaderDetails, pipeline, trace, debugContext);
+  IShaderViewer *s = m_Ctx.DebugShader(shaderDetails, pipeline, trace, debugContext);
 
   m_Ctx.AddDockWindow(s->Widget(), DockReference::AddTo, this);
 }
